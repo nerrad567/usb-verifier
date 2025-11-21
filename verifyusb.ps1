@@ -37,8 +37,8 @@ function EssentialsCheck {
 EssentialsCheck
 
 # ---------------- CONFIGURATION ----------------
-$ISOPath = "C:\Users\darre\Downloads\Win11_25H2_EnglishInternational_x64.iso"
-$USBDrive = "F:"
+$ISOPath = ""
+$USBDrive = ""
 $CodeExtensions = '\.exe$|\.dll$|\.sys$|\.cpl$|\.ocx$|\.efi$|\.bin$|\.scr$|\.ax$|\.drv$|\.sdb$|\.wim$'
 $ResourceExtensions = '\.mui$|\.xml$|\.ini$|\.manifest$|\.xsd$|\.txt$|\.cfg$'
 # -----------------------------------------------
