@@ -1,121 +1,177 @@
-# Windows USB Integrity Verifier & Resource Analyzer - PARANOID EDITION
+# usb-verifier
 
-**Version:** Updated / Paranoid Edition  
-**Author:** GL
-**Purpose:** Combines USB integrity verification with detailed analysis of modified resources. Ideal for checking Windows installation media and critical USB distributions.
+`usb-verifier` is a PowerShell-based tool to **verify Windows 11 USB installation media** against a known-good ISO.
 
----
+It performs layered integrity checks:
 
-## Overview
+- Root-level (non-WIM) file comparison
+- Deep inspection of internal `boot.wim`, `install.wim`, `.esd`, and split `.swm` files
+- Authenticode signature verification
+- XML and string-level difference analysis
 
-This PowerShell script performs a comprehensive comparison between a Windows ISO and a USB drive, detecting:
-
-- Hash mismatches between files
-- Modified code files (executables, DLLs, drivers)
-- Modified resource files (XML, MUI, configuration)
-- Extra or missing files on the USB
-- Validity of Microsoft digital signatures on modified code files
-- Detailed analysis of resource-only modifications (strings, PE headers, XML diffs)
-
-It provides a **Final Safety Assessment** indicating whether the USB is safe or requires review.
+Results are classified into **GREEN**, **ORANGE**, or **RED** threat levels — making it easy to tell if a USB installer is clean, customized, or potentially tampered with.
 
 ---
 
-## Features
+## 🧩 Scope & Tested Versions
 
-1. **Essentials Check**
-   - Ensures script is run as **Administrator**
-   - Verifies PowerShell version = 5.1
-   - Provides guidance if requirements are not met
+- **Supported OS:** Windows 11 installation media only
+- **Tested on:** Windows 11 consumer editions, **version 25H2**
+  - `en-us_windows_11_consumer_editions_version_25h2_x64_dvd_9934ee4c.iso`
+  - `en-gb_windows_11_consumer_editions_version_25h2_x64_dvd_f18d2cbd.iso`
+  - `*_windows_11_consumer_editions_version_25h2_updated_nov_2025_x64_*.iso`
 
-2. **File Hashing**
-   - Computes SHA-256 hashes for all ISO and USB files
-   - Builds dictionaries for efficient comparison
-
-3. **Comparison & Categorization**
-   - Identifies files that are identical, modified, missing, or extra
-   - Separates **code** vs **resource** modifications
-   - Detects split WIMs common in FAT32 USBs
-
-4. **Code File Analysis**
-   - Checks Authenticode signatures on modified code files
-   - Flags non-Microsoft or invalid signatures as suspicious
-
-5. **Resource File Analysis**
-   - Extracts and diffs printable strings (>20 characters)
-   - Performs XML line-by-line comparison
-   - Displays PE headers for resource-only files
-
-6. **Reporting**
-   - Detailed summary of:
-     - Total ISO & USB files
-     - Matched files
-     - Extra/missing files
-     - Modified code and resource files
-   - Final safety verdict: **Safe** or **STOP**
-
-7. **Cleanup**
-   - Dismounts ISO automatically after analysis
-   - Reports execution duration
+Other Windows 11 ISOs _may_ work, but Windows 10 and older are **not supported or tested**.
 
 ---
 
-## Requirements
+## ⚙️ Features
 
-- **Windows OS**
-- **PowerShell 5.1+**
-- **Administrator privileges** (needed for ISO mounting)
-- No third-party modules required; fully built-in
+### ✅ ISO Authenticity
 
----
+- Built-in SHA-256 database for official Windows 11 25H2 consumer ISOs
+- Optional `-KnownHashesFile` parameter for your own JSON of known-good hashes
 
-## Usage
+### ✅ Root Comparison
 
-1. Open PowerShell **as Administrator**.
-2. Set variables at the top of `verifyusb.ps1`:
+- Compares all ISO vs USB files (excluding WIM/ESD)
+- Detects and reports **Modified**, **Extra**, and **Missing** files
 
-    $ISOPath = "C:\path\to\windows.iso"
-    $USBDrive = "E:\"  # USB drive letter
+### ✅ Deep Image Scanning
 
-3. Run the script:
+- Optional `-DeepScanWIM` mounts and compares the internal contents of:
+  - `boot.wim`
+  - `install.wim`, `.esd`, or split `.swm`
+- Optional `-ReassembleWIM` merges `install*.swm` before scanning
+- Optional `-FullDeepScan` hashes _all_ internal files (instead of only critical types)
 
-    .\verifyusb.ps1
+### ✅ Threat-based Classification
 
-4. Optional: Redirect output to a file:
+- **GREEN:** Matches or benign Microsoft-signed files
+- **ORANGE:** Benign configuration or text differences
+- **RED:** Modified/extra unsigned binaries, drivers, or unknown files
 
-    .\verifyusb.ps1 | Out-File "usb_report.txt" -Encoding UTF8
+### ✅ Clean Reporting
 
----
-
-## Output
-
-The script displays:
-
-- Progress of hashing ISO and USB files
-- Summary of identical, extra, missing, and modified files
-- Signature validation results for modified code files
-- Resource file analysis (strings, XML diffs, PE headers)
-- Final safety assessment
+- Structured log sections for **BOOT**, **INSTALL**, and **ROOT**
+- Final summary with color-coded verdict
+- Automatic mount cleanup and temporary file removal
 
 ---
 
-## Notes
+## 🧱 Requirements
 
-- Modified resources are often benign (translations, metadata) but are displayed for review.
-- Split WIM detection is handled for FAT32 USB drives.
-- Script execution may take several minutes depending on USB size and number of files.
-
----
-
-## License
-
-This script is released under the MIT License.
+| Requirement    | Notes                                                |
+| -------------- | ---------------------------------------------------- |
+| **Host OS**    | Windows 11 (may run on 10, untested)                 |
+| **PowerShell** | ≥ 5.1 (7+ recommended for parallel hashing)          |
+| **Privileges** | Admin rights required for image mounting and cleanup |
+| **Tools**      | Built-in `DISM`; optional Sysinternals `handle.exe`  |
 
 ---
 
-## References
+## 🚀 Basic Usage
 
-- PowerShell Get-FileHash, Get-AuthenticodeSignature, Mount-DiskImage
-- [PowerShell Administrator guide](https://learn.microsoft.com/en-us/powershell/scripting/windows-powershell/starting-windows-powershell)
-- [Installing PowerShell](https://learn.microsoft.com/en-us/powershell/scripting/install/installing-powershell-on-windows)
+Run in **PowerShell as Administrator**:
 
+```powershell
+.\verifyusb.ps1 -ISOPath "C:\ISOs\Win11_25H2.iso" -USBDrive "E:"
+```
+
+This performs:
+
+1. Environment and ISO validation
+2. Root-level file hashing and comparison
+3. Summary verdict (no deep WIM scanning by default)
+
+---
+
+## 🧭 Full Usage Example
+
+```powershell
+.\verifyusb.ps1 `
+  -ISOPath "C:\ISOs\Win11_25H2.iso" `
+  -USBDrive "E:" `
+  -LogFile "C:\logs\usb_report.txt" `
+  -MaxAnalysisSizeMB 10 `
+  -VerboseDiffs `
+  -IgnoreFiles @("\sources\appraiser.sdb") `
+  -ReassembleWIM `
+  -DeepScanWIM `
+  -FullDeepScan `
+  -KnownHashesFile "C:\known-iso-hashes.json"
+```
+
+---
+
+## 🔧 Parameter Reference
+
+| Parameter                | Description                                           |
+| ------------------------ | ----------------------------------------------------- |
+| **`-ISOPath`**           | _(Required)_ Path to the Windows 11 ISO               |
+| **`-USBDrive`**          | _(Required)_ USB drive letter, e.g. `"E:"`            |
+| **`-LogFile`**           | Output log location (default `usb_report.txt`)        |
+| **`-MaxAnalysisSizeMB`** | Max file size for XML/string diffing (default 10 MB)  |
+| **`-VerboseDiffs`**      | Show full string/XML differences instead of summaries |
+| **`-IgnoreFiles`**       | Array of relative paths to ignore entirely            |
+| **`-ReassembleWIM`**     | Reassemble split `install*.swm` into temp WIM         |
+| **`-DeepScanWIM`**       | Enable deep internal WIM/ESD/SWM scanning             |
+| **`-FullDeepScan`**      | Hash and compare _all_ internal files                 |
+| **`-KnownHashesFile`**   | Path to custom JSON file of known-good ISO hashes     |
+
+Example JSON for `-KnownHashesFile`:
+
+```json
+{
+  "custom_win11_25h2.iso": "ABCDEF0123456789...",
+  "lab_build.iso": "0123456789ABCDEF..."
+}
+```
+
+---
+
+## 🧩 Example Output
+
+```text
+===== [SUMMARY] ===== Overall Threat Summary
+[SUMMARY] BOOT    : GREEN   – No internal differences
+[SUMMARY] INSTALL : GREEN   – No internal differences
+[SUMMARY] ROOT    : ORANGE  – 5 modified or extra files (docs/configs)
+[SUMMARY] Verdict : ORANGE WARNING – Likely benign (e.g. MCT customizations)
+```
+
+---
+
+## 🧠 Interpretation
+
+| Level      | Meaning                        | Typical Causes                                     |
+| ---------- | ------------------------------ | -------------------------------------------------- |
+| **GREEN**  | All critical files match; safe | Clean ISO or known tool-generated media            |
+| **ORANGE** | Minor differences              | Config/log/docs changes, benign XML edits          |
+| **RED**    | High-risk tampering            | Unsigned binaries, altered drivers, injected files |
+
+---
+
+## ⚠️ Limitations
+
+- Only validated for **Windows 11 25H2 consumer** ISOs
+- Requires `C:\Temp` for mounts/logs
+- DISM or locked files may occasionally need manual cleanup
+- “GREEN” means _identical to source_, not _trusted in absolute security terms_
+
+---
+
+## 🧰 Roadmap
+
+- JSON / HTML structured report output
+- Multi-USB comparison mode
+- Additional language ISO hash support
+- Extended signature metadata analysis
+
+---
+
+## 🪪 License
+
+MIT License  
+© 2025
+See `LICENSE` for full details.

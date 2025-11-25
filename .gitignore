@@ -1,0 +1,114 @@
+########################################
+# OS / Editor junk
+########################################
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Office / temp lock files
+~$*
+*.tmp
+
+# VS Code
+.vscode/
+*.code-workspace
+
+# Visual Studio (if it ever shows up)
+.vs/
+*.suo
+*.user
+*.userosscache
+*.sln.docstates
+
+########################################
+# Project-specific build / binary junk
+########################################
+
+# Mock installation media folders (rebuild via buildstruc.ps1)
+MockISO1/
+MockISO2/
+MockUSB/
+
+# ISOs generated with oscdimg
+*.iso
+
+# Windows imaging files (big + reproducible)
+*.wim
+*.esd
+*.swm
+
+# DISM / tool logs (if they end up in the repo)
+*.log
+
+# USB verifier reports
+usb_report*.txt
+
+########################################
+# Scratch / text junk
+########################################
+
+# Generic text scratch files
+# (Be aware this will ignore ALL .txt - including any docs you might want)
+*.txt
+
+# If you want to *keep* some docs, use .md or .rst instead.
+
+########################################
+# Secrets / credentials / env files
+########################################
+
+# Common env files
+.env
+.env.*
+*.env
+*.env.local
+
+# Generic secret/cred files
+*.secret
+*.secrets
+*.credentials
+*.cred
+*.config.secret
+secrets.json
+
+# Private keys / certs
+*.pem
+*.key
+*.pfx
+*.p12
+*.p7b
+*.jks
+*.keystore
+*.crt
+*.cer
+*.der
+
+# SSH keys (just in case)
+id_rsa
+id_rsa.*
+id_dsa
+id_ecdsa
+id_ed25519
+known_hosts
+
+# Token / API key dumps
+*token*
+*apikey*
+*api-key*
+
+########################################
+# PowerShell / shell history
+########################################
+
+# PowerShell console history
+ConsoleHost_history.txt
+
+# Bash/zsh history (if they accidentally land here)
+.bash_history
+.zsh_history
+
+########################################
+# OneDrive / sync noise (usually not needed here, but harmless)
+########################################
+*.lnk
+
