@@ -28,6 +28,9 @@ desktop.ini
 MockISO1/
 MockISO2/
 MockUSB/
+MockISO2a_IDEN/
+MockUSB2a_IDEN/
+
 
 # ISOs generated with oscdimg
 *.iso

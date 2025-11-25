@@ -1,4 +1,15 @@
-# usb-verifier
+<p align="center">
+  <h1 align="center">usb-verifier</h1>
+  <p align="center">🔐 Windows 11 USB integrity & tamper scanner (v1.0)</p>
+  <p align="center">
+    <img alt="OS" src="https://img.shields.io/badge/Windows-11-0078D6?logo=windows&logoColor=white">
+    <img alt="Shell" src="https://img.shields.io/badge/PowerShell-5.1%2B-5391FE?logo=powershell&logoColor=white">
+    <img alt="Status" src="https://img.shields.io/badge/Status-Stable%20v1.0-brightgreen">
+    <img alt="License" src="https://img.shields.io/badge/License-MIT-lightgrey">
+  </p>
+</p>
+
+---
 
 `usb-verifier` is a PowerShell-based tool to **verify Windows 11 USB installation media** against a known-good ISO.
 
@@ -9,13 +20,13 @@ It performs layered integrity checks:
 - Authenticode signature verification
 - XML and string-level difference analysis
 
-Results are classified into **GREEN**, **ORANGE**, or **RED** threat levels — making it easy to tell if a USB installer is clean, customized, or potentially tampered with.
+Results are classified into **GREEN**, **YELLOW**, or **RED** threat levels — making it easy to tell if a USB installer is clean, customized, or potentially tampered with.
 
 ---
 
 ## 🧩 Scope & Tested Versions
 
-- **Supported OS:** Windows 11 installation media only
+- **Supported media:** Windows 11 installation media only
 - **Tested on:** Windows 11 consumer editions, **version 25H2**
   - `en-us_windows_11_consumer_editions_version_25h2_x64_dvd_9934ee4c.iso`
   - `en-gb_windows_11_consumer_editions_version_25h2_x64_dvd_f18d2cbd.iso`
@@ -25,48 +36,82 @@ Other Windows 11 ISOs _may_ work, but Windows 10 and older are **not supported o
 
 ---
 
+## ✨ What’s new in v1.0
+
+- ✅ **ISO hash verification** against a built-in database of known-good 25H2 ISOs
+- ✅ **Persistent ISO lifecycle tracking** with optional reuse of existing mounts
+- ✅ **Cross-run cleanup** of script-mounted ISOs (`usb-verifier.state.json`)
+- ✅ **Graceful Ctrl+C handling** (cancels DISM, cleans up mounts, exits cleanly)
+- ✅ **More robust temp mount cleanup**, with optional aggressive mode using `handle.exe`
+- ✅ **Structured ROOT / BOOT / INSTALL summaries** with per-section threat levels
+
+---
+
 ## ⚙️ Features
 
 ### ✅ ISO Authenticity
 
 - Built-in SHA-256 database for official Windows 11 25H2 consumer ISOs
 - Optional `-KnownHashesFile` parameter for your own JSON of known-good hashes
+- Logs a **GREEN** “verified authentic” message if the hash matches
 
-### ✅ Root Comparison
+### ✅ Root Comparison (Surface Files)
 
 - Compares all ISO vs USB files (excluding WIM/ESD)
 - Detects and reports **Modified**, **Extra**, and **Missing** files
+- Extra and modified files are analysed by:
+  - File type (executables, scripts, configs, text, payload blobs)
+  - Signature status (valid Microsoft, unsigned, invalid)
+  - XML / string differences (for smaller files)
 
-### ✅ Deep Image Scanning
+### ✅ Deep Image Scanning (Internal WIM/ESD/SWM)
 
 - Optional `-DeepScanWIM` mounts and compares the internal contents of:
   - `boot.wim`
   - `install.wim`, `.esd`, or split `.swm`
-- Optional `-ReassembleWIM` merges `install*.swm` before scanning
+- Optional `-ReassembleWIM` merges `install*.swm` into a temp WIM before scanning
 - Optional `-FullDeepScan` hashes _all_ internal files (instead of only critical types)
+- Uses whole-image hashing first: if ISO/USB images are byte-identical, deep scan short-circuits as **clean**
 
 ### ✅ Threat-based Classification
 
 - **GREEN:** Matches or benign Microsoft-signed files
-- **ORANGE:** Benign configuration or text differences
-- **RED:** Modified/extra unsigned binaries, drivers, or unknown files
+- **YELLOW:** Configuration/text differences, missing/extra non-executables, version drift
+- **RED:** Modified/extra unsigned binaries, drivers, scripts or payload-style blobs
 
-### ✅ Clean Reporting
+Final output includes:
 
-- Structured log sections for **BOOT**, **INSTALL**, and **ROOT**
-- Final summary with color-coded verdict
-- Automatic mount cleanup and temporary file removal
+- Overall verdict: **GREEN / YELLOW / RED**
+- Per-section status for:
+  - `ROOT (Surface files)`
+  - `BOOT (Internal image)`
+  - `INSTALL (Internal image)`
+
+### ✅ Clean Reporting & Lifecycle
+
+- Structured log sections for **ENVIRONMENT**, **ISO**, **ROOT**, **BOOT**, and **INSTALL**
+- Final **“USB Verification Summary”** with:
+  - Per-section Modified/Extra/Missing counts
+  - Green/Yellow/Red breakdown
+  - Short explanation of why a section is marked RED/YELLOW (by file type)
+- Automatic mount and temp cleanup:
+  - Uses `DISM /Cleanup-Mountpoints`
+  - Cleans up `C:\Temp\mount_*` and temporary WIMs
+  - Cleans up script-mounted ISOs across runs while respecting user-mounted ones
 
 ---
 
 ## 🧱 Requirements
 
-| Requirement    | Notes                                                |
-| -------------- | ---------------------------------------------------- |
-| **Host OS**    | Windows 11 (may run on 10, untested)                 |
-| **PowerShell** | ≥ 5.1 (7+ recommended for parallel hashing)          |
-| **Privileges** | Admin rights required for image mounting and cleanup |
-| **Tools**      | Built-in `DISM`; optional Sysinternals `handle.exe`  |
+| Requirement    | Notes                                                                |
+| -------------- | -------------------------------------------------------------------- |
+| **Host OS**    | Windows 11 (may run on 10, untested)                                 |
+| **PowerShell** | ≥ 5.1 (7+ recommended for parallel hashing)                          |
+| **Privileges** | Admin rights strongly recommended for image mounting and deep scans  |
+| **Tools**      | Built-in `DISM`; optional Sysinternals `handle.exe` for lock tracing |
+| **Temp Path**  | Uses `C:\Temp` for DISM logs, mounts, and temporary WIM files        |
+
+> ℹ️ Some features (deep WIM scan, SWM reassembly, aggressive cleanup) will skip or downgrade gracefully if not running as admin.
 
 ---
 
@@ -80,9 +125,10 @@ Run in **PowerShell as Administrator**:
 
 This performs:
 
-1. Environment and ISO validation
-2. Root-level file hashing and comparison
-3. Summary verdict (no deep WIM scanning by default)
+1. Environment validation
+2. ISO hash check against the known-good list (plus optional -KnownHashesFile)
+3. Root-level file hashing and comparison
+4. Summary verdict (no deep WIM scanning by default)
 
 ---
 
@@ -134,21 +180,35 @@ Example JSON for `-KnownHashesFile`:
 
 ```text
 ===== [SUMMARY] ===== Overall Threat Summary
-[SUMMARY] BOOT    : GREEN   – No internal differences
-[SUMMARY] INSTALL : GREEN   – No internal differences
-[SUMMARY] ROOT    : ORANGE  – 5 modified or extra files (docs/configs)
-[SUMMARY] Verdict : ORANGE WARNING – Likely benign (e.g. MCT customizations)
+[RESULT] USB Verification Summary
+[RESULT] ==================== FINAL RESULT ====================
+[RESULT] [ OK ] Overall verdict: GREEN
+[RESULT] ------------------------------------------------------
+[RESULT] [ OK ] ROOT (Surface files): GREEN | Modified: 0, Extra: 0, Missing: 0
+[RESULT]        Breakdown: Green=12, Yellow=0, Red=0
+[RESULT] [ OK ] BOOT (Internal image): GREEN | No differences
+[RESULT] [ OK ] INSTALL (Internal image): GREEN | No differences
+[RESULT] ======================================================
+
+Example with a warning:
+[RESULT] [WARN] Overall verdict: YELLOW
+[RESULT] [FAIL] ROOT (Surface files): RED | Modified: 2, Extra: 1, Missing: 0
+[RESULT]        Files: \autorun.inf, \sources\offline.xml, \__chunk_data\chunk1.bin
+[RESULT]        Reason (RED): includes script/executable changes; includes binary payload-style files.
+
 ```
 
 ---
 
 ## 🧠 Interpretation
 
-| Level      | Meaning                        | Typical Causes                                     |
-| ---------- | ------------------------------ | -------------------------------------------------- |
-| **GREEN**  | All critical files match; safe | Clean ISO or known tool-generated media            |
-| **ORANGE** | Minor differences              | Config/log/docs changes, benign XML edits          |
-| **RED**    | High-risk tampering            | Unsigned binaries, altered drivers, injected files |
+| Level      | Meaning                           | Typical Causes                                            |
+| ---------- | --------------------------------- | --------------------------------------------------------- |
+| **GREEN**  | All critical files match; safe    | Clean ISO or known tool-generated media                   |
+| **YELLOW** | Minor or expected differences     | Config/log/docs changes, benign XML edits, MCT variations |
+| **RED**    | High-risk or suspicious tampering | Unsigned binaries, altered drivers, injected payloads     |
+
+⚠️ Important: “GREEN” means “matches your ISO source”, not “cryptographically blessed by Microsoft forever”. If your ISO is compromised, your USB will faithfully match that compromise.
 
 ---
 
@@ -157,16 +217,7 @@ Example JSON for `-KnownHashesFile`:
 - Only validated for **Windows 11 25H2 consumer** ISOs
 - Requires `C:\Temp` for mounts/logs
 - DISM or locked files may occasionally need manual cleanup
-- “GREEN” means _identical to source_, not _trusted in absolute security terms_
-
----
-
-## 🧰 Roadmap
-
-- JSON / HTML structured report output
-- Multi-USB comparison mode
-- Additional language ISO hash support
-- Extended signature metadata analysis
+- Network shares, heavily locked files, or AV interference may affect results
 
 ---
 

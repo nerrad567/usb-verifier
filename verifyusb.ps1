@@ -70,18 +70,66 @@ $script:ISOContext = @{
     MountedByScript = $false  # True if this script mounted it
 }
 
+$script:ISOHashInfo = @{
+    Hash        = $null   # SHA256 of the ISO
+    Status      = 'Unknown'  # 'KnownGood' / 'Unknown' / 'Error'
+    MatchedName = $null   # ISO filename key if it matched
+}
+
+
+# CTRL C tracker
+$script:Cancelled = $false
+
+
 # Persistent state on disk for cross-run ISO tracking
 $script:StateFilePath = Join-Path $PSScriptRoot 'usb-verifier.state.json'
 
 # Structured summary for final report
 $script:ScanSummary = @{}
+$script:SectionDetails = @{}
+
 
 # Functions
+
+function Show-StartupBanner {
+    param(
+        [datetime]$StartTime
+    )
+
+    # Tiny spinner just for some flair (doesn't slow things much)
+    $spinner = @('|','/','-','\')
+    $phrase  = "Initialising usb-verifier..."
+    for ($i = 0; $i -lt 16; $i++) {
+        $frame = $spinner[$i % $spinner.Length]
+        Write-Host ("`r{0} {1}" -f $frame, $phrase) -NoNewline -ForegroundColor Yellow
+        Start-Sleep -Milliseconds 80
+    }
+    Write-Host "`r  $phrase" -ForegroundColor Yellow
+    Write-Host ""
+
+    $timeStr = $StartTime.ToString("yyyy-MM-dd HH:mm:ss")
+
+    # Fancy banner
+    Write-Host ""
+    Write-Host "╔══════════════════════════════════════════════════════════════╗" -ForegroundColor Cyan
+    Write-Host "║  usb-verifier                                                ║" -ForegroundColor Cyan
+    Write-Host "║  Windows install USB integrity & threat scanner              ║" -ForegroundColor Cyan
+    Write-Host "║                                                              ║" -ForegroundColor Cyan
+    Write-Host ("║  Start time : {0,-44}   ║" -f $timeStr) -ForegroundColor Cyan
+    Write-Host "║  Press Ctrl+C at any time to abort                           ║" -ForegroundColor Cyan
+    Write-Host "╚══════════════════════════════════════════════════════════════╝" -ForegroundColor Cyan
+    Write-Host ""
+
+    # Still record a clean line in the log file
+    Write-Log "Starting Operations - Press Ctrl+C to interrupt." -Level "IMPORTANT"
+}
+
 
 function Get-ISOState {
     if (Test-Path $script:StateFilePath) {
         try {
-            $state = Get-Content $script:StateFilePath -Raw | ConvertFrom-Json
+            $raw = Get-Content -LiteralPath $script:StateFilePath | Out-String
+            $state = $raw | ConvertFrom-Json
             if (-not $state.MountedISOs) {
                 $state | Add-Member -MemberType NoteProperty -Name MountedISOs -Value @() -Force
             }
@@ -94,6 +142,7 @@ function Get-ISOState {
         return @{ MountedISOs = @() }
     }
 }
+
 
 function Save-ISOState {
     param(
@@ -136,7 +185,7 @@ function Cleanup-PreviousScriptISOs {
             $choice = Read-Host $prompt
 
             if ($choice -eq '' -or $choice -eq 'Y' -or $choice -eq 'y') {
-                Dismount-DiskImage -ImagePath $path -ErrorAction Stop
+                Dismount-DiskImage -ImagePath $path -ErrorAction Stop | Out-Null
                 Write-Log "Dismounted leftover ISO from earlier run: $path"
             } else {
                 Write-Log "User chose to keep previously mounted ISO attached: $path"
@@ -290,13 +339,21 @@ function Get-LockingProcesses {
 
 
 function Check-ForInterrupt {
+    # If we've already seen Ctrl+C once, just honour it everywhere
+    if ($script:Cancelled) {
+        throw [System.OperationCanceledException]::new("User cancelled (Ctrl+C).")
+    }
+
     if ([Console]::KeyAvailable) {
         $key = [Console]::ReadKey($true)
         if ($key.Key -eq "C" -and $key.Modifiers -band [ConsoleModifiers]::Control) {
-            throw "Ctrl+C detected."
+            $script:Cancelled = $true
+            Write-Log "Ctrl+C detected – attempting graceful cancellation..." -Level "WARNING"
+            throw [System.OperationCanceledException]::new("User cancelled (Ctrl+C).")
         }
     }
 }
+
 
 function Is-MountDirMounted {
     param([string]$MountDir)
@@ -355,30 +412,68 @@ function Clean-TempMounts {
                 $folderPercent = [math]::Round((($i / $total) * 100))
                 Write-Progress -Activity "Deleting mount folders" -Status "Processing $($i+1)/${total}: $($folder.Name)" -PercentComplete $folderPercent
 
-                # Check if still mounted
-                if (Is-MountDirMounted -MountDir $folder.FullName) {
-                    Write-Log "Folder $($folder.Name) is still mounted. Attempting to unmount again."
-                    $dismArgs = @('/Unmount-Image', "/MountDir:$($folder.FullName)", '/Discard')
-                    try {
-                        Run-DismWithProgress -DismArgs $dismArgs -Activity "Unmounting stuck mount $($folder.Name)"
-                    } catch {
-                        Write-Log "Failed to unmount stuck folder $($folder.Name): $($_.Exception.Message)" -Level "WARNING"
-                    }
-                    Start-Sleep -Seconds 5
-                }
-
-                # Check if folder is populated (failed unmount)
+                # Check if folder looks "big/broken"
                 $fileCount = 0
                 try {
                     $fileCount = (Get-ChildItem $folder.FullName -Recurse -File -ErrorAction Stop | Measure-Object).Count
                 } catch {
                     $fileCount = -1  # Error, perhaps access denied
                 }
+
                 if ($fileCount -gt 10 -or $fileCount -eq -1) {
-                    Write-Log "Folder $($folder.Name) appears populated or inaccessible ($fileCount files), likely failed unmount. Skipping deletion to avoid long delays. Manual cleanup recommended." -Level "WARNING"
-                    continue
+                    Write-Log "Folder $($folder.Name) appears populated or inaccessible ($fileCount files), likely failed unmount or in-use image." -Level "WARNING"
+
+                    $choice = Read-Host "Attempt AGGRESSIVE cleanup of $($folder.Name)? This may kill locking processes, retry unmount and delete the folder. (Y/N, default N)"
+                    if ($choice -ne 'Y' -and $choice -ne 'y') {
+                        Write-Log "User chose to skip aggressive cleanup for $($folder.Name). Manual cleanup recommended." -Level "WARNING"
+                        continue
+                    }
+
+                    Write-Log "User requested aggressive cleanup for $($folder.Name). This may take some time..." -Level "WARNING"
+
+                    # 1) Use handle.exe FIRST to find/kill lockers if available
+                    if ($HasHandleExe) {
+                        Write-Log "Checking for locking processes on $($folder.FullName) before unmount..." -Level "WARNING"
+                        $procs = Get-LockingProcesses -Path $folder.FullName
+                        if ($procs.Count -gt 0) {
+                            Write-Log "Processes locking $($folder.FullName):" -Level "WARNING"
+                            $procs | ForEach-Object { Write-Log " - $($_.ProcessName) (PID $($_.Id))" -Level "WARNING" }
+
+                            $killChoice = Read-Host "Kill these locking processes before retrying unmount? (Y/N, default N)"
+                            if ($killChoice -eq 'Y' -or $killChoice -eq 'y') {
+                                foreach ($proc in $procs) {
+                                    try {
+                                        Stop-Process -Id $proc.Id -Force
+                                        Write-Log "Killed $($proc.ProcessName) (PID $($proc.Id))"
+                                    } catch {
+                                        Write-Log "Failed to kill $($proc.ProcessName): $($_.Exception.Message)" -Level "WARNING"
+                                    }
+                                }
+                                Start-Sleep -Seconds 2
+                            } else {
+                                Write-Log "User chose not to kill locking processes for $($folder.FullName) before unmount."
+                            }
+                        } else {
+                            Write-Log "No locking processes reported by handle.exe for $($folder.FullName) before unmount."
+                        }
+                    } else {
+                        Write-Log "handle.exe not available; skipping pre-unmount lock inspection." -Level "WARNING"
+                    }
+
+                    # 2) After dealing with lockers, *then* retry a clean DISM unmount if it still looks mounted
+                    if (Is-MountDirMounted -MountDir $folder.FullName) {
+                        Write-Log "Folder $($folder.Name) still appears mounted. Attempting another force-unmount via DISM." -Level "WARNING"
+                        $dismArgs = @('/Unmount-Image', "/MountDir:$($folder.FullName)", '/Discard')
+                        try {
+                            Run-DismWithProgress -DismArgs $dismArgs -Activity "Force-unmount stuck mount $($folder.Name)"
+                        } catch {
+                            Write-Log "Second unmount attempt failed for $($folder.Name): $($_.Exception.Message)" -Level "WARNING"
+                        }
+                        Start-Sleep -Seconds 5
+                    }
                 }
 
+                # 3) Nuclear-ish delete loop (with retries + handle.exe inside on failure)
                 $retryAttempts = 3
                 $ownershipApplied = $false
                 $deleted = $false
@@ -423,14 +518,14 @@ function Clean-TempMounts {
                         Write-Log "Attempt $attempt/$retryAttempts failed to delete $($folder.FullName): $($_.Exception.Message)" -Level "WARNING"
 
                         if ($HasHandleExe) {
-                            Write-Log "Checking for locking processes on $($folder.FullName)..."
+                            Write-Log "Checking for locking processes on $($folder.FullName) after delete failure..." -Level "WARNING"
                             $procs = Get-LockingProcesses -Path $folder.FullName
                             if ($procs.Count -gt 0) {
                                 Write-Log "Processes locking $($folder.FullName):" -Level "WARNING"
                                 $procs | ForEach-Object { Write-Log " - $($_.ProcessName) (PID $($_.Id))" -Level "WARNING" }
 
-                                $choice = Read-Host "Do you want to kill these processes? (Y/N)"
-                                if ($choice -eq 'Y') {
+                                $killChoice = Read-Host "Do you want to kill these processes before next delete attempt? (Y/N, default N)"
+                                if ($killChoice -eq 'Y' -or $killChoice -eq 'y') {
                                     foreach ($proc in $procs) {
                                         try {
                                             Stop-Process -Id $proc.Id -Force
@@ -439,11 +534,12 @@ function Clean-TempMounts {
                                             Write-Log "Failed to kill $($proc.ProcessName): $($_.Exception.Message)" -Level "WARNING"
                                         }
                                     }
+                                    Start-Sleep -Seconds 2
                                 } else {
-                                    Write-Log "User chose not to kill locking processes for $($folder.FullName)"
+                                    Write-Log "User chose not to kill locking processes for $($folder.FullName) on this attempt."
                                 }
                             } else {
-                                Write-Log "No locking processes found for $($folder.FullName)"
+                                Write-Log "No locking processes found for $($folder.FullName) after delete failure."
                             }
                         } else {
                             Write-Log "Skipping locked-process detection (handle.exe not available)" -Level "WARNING"
@@ -508,17 +604,30 @@ function Clean-TempMounts {
     }
 }
 
+
+
 function Get-FileHashes {
     param (
-    [string]$RootPath,
-    [string[]]$FileFilter = @('*'),
-    [string]$SourceType = "General"
-)
-    Write-Log "Hashing $SourceType files in $RootPath" -NoTimestamp -Level "IMPORTANT" -Header -Context "OPERATION"
+        [string]$RootPath,
+        [string[]]$FileFilter = @('*'),
+        [string]$SourceType = "General",
+        [switch]$SuppressHeader
+    )
+
+    if (-not $SuppressHeader) {
+        Write-Log "Hashing $SourceType files in $RootPath" -NoTimestamp -Level "IMPORTANT" -Header -Context "OPERATION"
+    }
+
     $hashes = @{}
     $files = Get-ChildItem -Path $RootPath -Recurse -File -Include $FileFilter -ErrorAction SilentlyContinue
     $total = $files.Count
-    Write-Log "Hashing $total files..."
+
+    if (-not $SuppressHeader) {
+        Write-Log "Hashing $total files..."
+    } else {
+        # Optional: still log a lighter line if you want
+        Write-Log "Hashing $total $SourceType files in $RootPath" -Level "INFO"
+    }
     
     if ($PSVersionTable.PSVersion.Major -ge 7 -and $total -gt 100) {  # Use parallel for large sets
         $results = $files | ForEach-Object -Parallel {
@@ -532,7 +641,7 @@ function Get-FileHashes {
                 Write-Host "Failed to hash ${relPath}: $($_.Exception.Message)"  # Console output since Write-Log may not be thread-safe
                 return $null
             }
-        } -ThrottleLimit 8  # Adjust based on cores (e.g., 6-12 for your CPU)
+        } -ThrottleLimit 8
         
         foreach ($result in $results) {
             if ($result) {
@@ -559,6 +668,8 @@ function Get-FileHashes {
 
     return $hashes
 }
+
+   
 
 function Get-FileHashWithProgress {
     param ([string]$Path)
@@ -591,6 +702,12 @@ function Run-DismWithProgress {
         [string]$Activity,
         [string]$Context = "General"
     )
+
+    $tempOut = $null
+    $tempErr = $null
+    $dismLog = $null
+    $proc    = $null
+
     try {
         $tempOut = "C:\Temp\dism_out_$(Get-Random).txt"
         $tempErr = "C:\Temp\dism_err_$(Get-Random).txt"
@@ -603,9 +720,11 @@ function Run-DismWithProgress {
         $proc = Start-Process "Dism.exe" -ArgumentList $DismArgs -NoNewWindow -RedirectStandardOutput $tempOut -RedirectStandardError $tempErr -PassThru -ErrorAction Stop
         
         $lastPercent = 0
-        $startTime = Get-Date
+        $startTime   = Get-Date
+
         while (-not $proc.HasExited) {
-            Check-ForInterrupt
+            Check-ForInterrupt   # <-- Ctrl+C respected even while DISM is running
+
             $lines = Get-Content $tempOut -Tail 5 -ErrorAction SilentlyContinue
             $percentFound = $false
             foreach ($line in $lines) {
@@ -627,13 +746,21 @@ function Run-DismWithProgress {
         }
         Write-Progress -Activity $Activity -Completed
         
-        $outContent = Get-Content $tempOut -Raw -ErrorAction SilentlyContinue
-        $errContent = Get-Content $tempErr -Raw -ErrorAction SilentlyContinue
-        
+        $outContent = ""
+        $errContent = ""
+
+        if (Test-Path $tempOut) {
+            $outContent = Get-Content -LiteralPath $tempOut | Out-String
+        }
+        if (Test-Path $tempErr) {
+            $errContent = Get-Content -LiteralPath $tempErr | Out-String
+        }
+
         $outLines = $outContent -split "`n"
-        $filteredOut = $outLines | Where-Object { $_ -notmatch '%' }
+        $filteredOut = $outLines | Where-Object { $_.Trim() -ne '' -and $_ -notmatch '%' }
+
         Write-Log "Dism output summary for ${Activity}: $($filteredOut -join "`n")" -Level "INFO" -Context $Context
-        
+
         if ($proc.ExitCode -eq 0) {
             Write-Log "Dism completed successfully for ${Activity}." -Level "INFO" -Context $Context
         } else {
@@ -643,20 +770,44 @@ function Run-DismWithProgress {
             }
             throw "Dism failed (code $($proc.ExitCode)): $outContent $errContent"
         }
-        
+
         if ((Test-Path $dismLog) -and ($proc.ExitCode -ne 0)) {
-            Write-Log "DISM internal log: $(Get-Content $dismLog -Raw)" -Level "ERROR" -Context $Context
+            $logText = Get-Content -LiteralPath $dismLog | Out-String
+            Write-Log "DISM internal log: $logText" -Level "ERROR" -Context $Context
         }
-        
+
         Remove-Item $tempOut, $tempErr, $dismLog -Force -ErrorAction SilentlyContinue
+
     } catch {
+        # If this is our Ctrl+C cancellation, kill DISM and bubble up cleanly
+        if ($_.Exception -is [System.OperationCanceledException]) {
+            Write-Log "DISM operation '${Activity}' cancelled by user – terminating process and cleaning up." -Level "WARNING" -Context $Context
+
+            if ($proc -and -not $proc.HasExited) {
+                try { Stop-Process -Id $proc.Id -Force -ErrorAction SilentlyContinue } catch {}
+            }
+
+            if ($tempOut -or $tempErr -or $dismLog) {
+                Remove-Item $tempOut, $tempErr, $dismLog -Force -ErrorAction SilentlyContinue
+            }
+
+            Write-Progress -Activity $Activity -Completed
+            throw   # rethrow so main flow can see it's a cancellation, not a hard error
+        }
+
         Write-Log "Dism error in ${Activity}: $($_.Exception.Message)" -Level "ERROR" -Context $Context
-        if (Test-Path $tempOut) { Write-Log (Get-Content $tempOut -Raw) -Level "ERROR" -Context $Context }
-        if (Test-Path $tempErr) { Write-Log (Get-Content $tempErr -Raw) -Level "ERROR" -Context $Context }
+        if (Test-Path $tempOut) {
+            Write-Log (Get-Content -LiteralPath $tempOut | Out-String) -Level "ERROR" -Context $Context
+        }
+        if (Test-Path $tempErr) {
+            Write-Log (Get-Content -LiteralPath $tempErr | Out-String) -Level "ERROR" -Context $Context
+        }
         Remove-Item $tempOut, $tempErr, $dismLog -Force -ErrorAction SilentlyContinue
+        Write-Progress -Activity $Activity -Completed
         throw
     }
 }
+
 
 
 function Mount-Image {
@@ -739,7 +890,7 @@ function Unmount-Image {
 
 function Reassemble-SWMToTemp {
     param ([string]$SourcePath, [string]$TempPath)
-    Write-Log "SWM Reassembly Start" -NoTimestamp -Level "IMPORTANT" -Header -Context "USB"
+    Write-Log "SWM Reassembly Start" -NoTimestamp -Level "IMPORTANT" -Header -Context "OPERATION"
     try {
         if ((Get-PSDrive C).Free / 1GB -lt 7) { throw "Low space on C: for reassembly." }
         Write-Log "Reassembling SWM: $SourcePath"
@@ -794,6 +945,10 @@ function Decompress-ESDToTemp {
         Write-Log "Decompressed WIM prepared: $TempPath"
         return $TempPath
     } catch {
+        if ($_.Exception -is [System.OperationCanceledException]) {
+            Write-Log "ESD decompression for $SourcePath cancelled by user." -Level "WARNING"
+            throw
+        }
         Write-Log "Decompression failed: $($_.Exception.Message)" -Level "RED"
         return $null
     }
@@ -849,35 +1004,37 @@ function Analyze-File {
     $ext         = [IO.Path]::GetExtension($FilePath).ToLower()
 
     # Extension groups
-    $codeExt     = @('.exe', '.dll', '.sys', '.drv', '.ocx', '.scr')
+    $codeExt     = @('.exe', '.dll', '.sys', '.drv', '.ocx', '.scr', '.efi')                   # PE-style / boot code
+    $scriptExt   = @('.ps1', '.psm1', '.bat', '.cmd', '.vbs', '.js', '.jse', '.wsf')           # scriptable
     $resourceExt = @('.xml', '.mui', '.inf', '.sdb', '.manifest', '.cfg', '.ini', '.cat')
     $docExt      = @('.txt', '.rtf', '.log', '.md')
+    $binExt      = @('.bin', '.dat', '.pak', '.cab')                                           # payload-style binaries
+
+    # Everything we explicitly know about
+    $knownExt    = $codeExt + $scriptExt + $resourceExt + $docExt + $binExt
+
+
+    # Only these get Authenticode checks
+    $signedExt   = $codeExt + '.cat'
 
     $validMsSig  = $false
-    $sigStatus   = $null
 
     if ([string]::IsNullOrEmpty($FilePath) -or -not (Test-Path $FilePath)) {
         $note += "Invalid file path; skipping analysis."
         return @{ Threat = "WARNING"; Note = $note }
     }
 
-    #
-    # 1) Signature analysis (for code-like files)
-    #
-    if ($ext -in ($codeExt + '.cat')) {
+    # 1) Signature analysis (for PE-like files only)
+    if ($ext -in $signedExt) {
         try {
             $sig = Get-AuthenticodeSignature $FilePath -ErrorAction Stop
-            $sigStatus = $sig.Status
-
             if ($sig.Status -eq "Valid" -and $sig.SignerCertificate.Subject -match 'Microsoft') {
                 $validMsSig = $true
                 $note += "Valid Microsoft signature ($($sig.SignerCertificate.Subject))"
-            }
-            elseif ($sig.Status -eq "NotSigned") {
+            } elseif ($sig.Status -eq "NotSigned") {
                 $note += "Not signed"
                 $threatLevel = [math]::Max($threatLevel, 1)
-            }
-            else {
+            } else {
                 $note += "Invalid signature: $($sig.StatusMessage)"
                 $threatLevel = [math]::Max($threatLevel, 2)
             }
@@ -886,62 +1043,66 @@ function Analyze-File {
             $threatLevel = [math]::Max($threatLevel, 1)
         }
     }
+    # NOTE: we *do not* attempt Authenticode on $binExt (e.g. .bin) because they are
+    # not normally signed this way; their integrity comes from higher-level structures.
 
-    #
     # 2) Deep comparison for MODIFIED files (strings/XML)
-    #
     if ($Status -eq 'Modified' -and $fileSizeMB -le $MaxAnalysisSizeMB) {
         try {
             $usbStrings = Extract-PrintableStrings $FilePath
-            $isoStrings = $null
 
-            if ($IsoData) {
-                # Pre-supplied ISO data (XML OuterXml or string array)
+            $isoStrings = $null
+            $haveIsoData = $false
+
+            # Prefer pre-supplied IsoData if we got it
+            if ($IsoData -ne $null) {
                 $isoStrings = $IsoData
+                $haveIsoData = $true
             }
             elseif (-not [string]::IsNullOrEmpty($IsoFilePath) -and (Test-Path $IsoFilePath)) {
                 if ($ext -eq '.xml') {
-                    $isoContent = Get-Content $IsoFilePath -Raw
+                    $isoContent = Get-Content -LiteralPath $IsoFilePath -Raw
                     $isoXml = [xml]$isoContent
                     $isoStrings = $isoXml.OuterXml
                 } else {
                     $isoStrings = Extract-PrintableStrings $IsoFilePath
                 }
+                $haveIsoData = $true
             }
             else {
+                # No ISO-side data available at all
                 $note += "No ISO data available for comparison; skipping deep analysis"
-                $threatLevel = [math]::Max($threatLevel, 2)  # High concern if we can't compare
-                throw "No ISO data"
+                $threatLevel = [math]::Max($threatLevel, 1)
             }
 
-            if ($ext -eq '.xml') {
-                $usbContent = Get-Content $FilePath -Raw
-                $usbXml = [xml]$usbContent
-                $usbStr = $usbXml.OuterXml
-                $isoStr = $isoStrings  # already OuterXml
+            if ($haveIsoData) {
+                if ($ext -eq '.xml') {
+                    $usbContent = Get-Content -LiteralPath $FilePath -Raw
+                    $usbXml = [xml]$usbContent
+                    $usbStr = $usbXml.OuterXml
+                    $isoStr = [string]$isoStrings
 
-                if ($usbStr -ne $isoStr) {
-                    $diff = Compare-Object ($isoStr -split "`n") ($usbStr -split "`n")
-                    $note += "XML differences: "
-                    if ($VerboseDiffs) {
-                        $note += ($diff | Out-String)
-                    } else {
-                        $note += "$($diff.Count) changes detected"
+                    if ($usbStr -ne $isoStr) {
+                        $diff = Compare-Object ($isoStr -split "`n") ($usbStr -split "`n")
+                        $note += "XML differences: "
+                        if ($VerboseDiffs) {
+                            $note += ($diff | Out-String)
+                        } else {
+                            $note += "$($diff.Count) changes detected"
+                        }
+                        $threatLevel = [math]::Max($threatLevel, 1)
                     }
-                    # XML/resource change -> at least WARNING
-                    $threatLevel = [math]::Max($threatLevel, 1)
-                }
-            }
-            else {
-                $diff = Compare-Object $isoStrings $usbStrings
-                if ($diff) {
-                    $note += "String differences: "
-                    if ($VerboseDiffs) {
-                        $note += ($diff | Out-String)
-                    } else {
-                        $note += "$($diff.Count) changes (added/removed strings)"
+                } else {
+                    $diff = Compare-Object $isoStrings $usbStrings
+                    if ($diff) {
+                        $note += "String differences: "
+                        if ($VerboseDiffs) {
+                            $note += ($diff | Out-String)
+                        } else {
+                            $note += "$($diff.Count) changes (added/removed strings)"
+                        }
+                        $threatLevel = [math]::Max($threatLevel, 1)
                     }
-                    $threatLevel = [math]::Max($threatLevel, 1)
                 }
             }
         } catch {
@@ -954,14 +1115,10 @@ function Analyze-File {
         $threatLevel = [math]::Max($threatLevel, 1)
     }
 
-    #
-    # 3) EXTRA files: default WARNING, then refine by type
-    #
+    # 3) EXTRA files
     if ($Status -eq 'Extra') {
-        # By default, an extra file is at least WARNING
         $threatLevel = [math]::Max($threatLevel, 1)
         $note += "Extra file"
-
         if ($fileSizeMB -le $MaxAnalysisSizeMB) {
             $strings = Extract-PrintableStrings $FilePath
             if ($strings) {
@@ -970,45 +1127,65 @@ function Analyze-File {
         }
     }
 
-    #
-    # 4) Extension-driven adjustments (final risk shaping)
-    #
-
-    # 4a) Executables / drivers without valid MS sig are hard RED if modified/extra
+    # 4) Extension-driven tweaks
+    # High-risk: executables without valid Microsoft signature
     if ($ext -in $codeExt -and -not $validMsSig -and ($Status -eq 'Modified' -or $Status -eq 'Extra')) {
         $threatLevel = 2
         if ($note -notmatch "Executable without valid Microsoft signature") {
-            $note += "; Executable without valid Microsoft signature"
+            $note += "; Executable without valid Microsoft signature (high risk)"
         }
     }
 
-    # 4b) Resource-type files (xml, mui, cfg, inf, etc):
-    #     modified resources are WARNING by default (unless already escalated)
-    if ($Status -eq 'Modified' -and $ext -in $resourceExt) {
-        $threatLevel = [math]::Max($threatLevel, 1)
+    # High-risk: script files (can execute payloads even though they aren't Authenticode-signed)
+    if ($ext -in $scriptExt -and ($Status -eq 'Modified' -or $Status -eq 'Extra')) {
+        $threatLevel = 2
+        if ($note -notmatch "Script file capable of executing code") {
+            $note += "; Script file capable of executing code (high risk)"
+        }
     }
 
-    # 4c) Benign docs: extra small txt/rtf/log treated as WARNING, not RED
+    # Medium-risk: config / metadata changes
+    if ($Status -eq 'Modified' -and $ext -in $resourceExt) {
+        $threatLevel = [math]::Max($threatLevel, 1)
+        # (Note text already added in deep comparison section if diffs exist)
+    }
+
+    # Low-risk: tiny text/log extras
     if ($Status -eq 'Extra' -and $ext -in $docExt -and $fileSizeMB -le 1) {
-        # ensure we do NOT escalate above WARNING for small doc extras
-        if ($threatLevel -gt 1) {
-            # leave as-is if something else forced RED (e.g., weird sig situation),
-            # otherwise cap at WARNING
-            $threatLevel = $threatLevel
-        } else {
+        if ($threatLevel -lt 2) {
             $threatLevel = 1
         }
     }
 
-    #
-    # 5) Final mapping from numeric threatLevel to label
-    #
+    # High-risk: binary payload files that don't match the ISO (no certs expected)
+    if ($ext -in $binExt -and ($Status -eq 'Modified' -or $Status -eq 'Extra')) {
+        # Force high severity for payload blobs
+        $threatLevel = 2
+        if ($note -notmatch "Binary payload-style file differs from ISO") {
+            $note += "; Binary payload-style file differs from ISO (high risk; signatures not expected for this type)"
+        }
+    }
+
+    # Catch-all: any unknown/other extension (including none) is high-risk if it differs
+    if (($Status -eq 'Modified' -or $Status -eq 'Extra') -and -not [string]::IsNullOrWhiteSpace($FilePath)) {
+        if (-not $knownExt.Contains($ext)) {
+            $threatLevel = 2
+            if ($note -notmatch "Unknown or non-standard file type differs from ISO") {
+                $note += "; Unknown or non-standard file type differs from ISO (conservative high-risk classification)"
+            }
+        }
+    }
+
+
+    # 5) Map level → label
     $threat = if ($threatLevel -ge 2) { "RED" }
               elseif ($threatLevel -eq 1) { "WARNING" }
               else { "GREEN" }
 
     return @{ Threat = $threat; Note = $note }
 }
+
+
 
 
 function New-DeepWIMScanContext {
@@ -1109,13 +1286,13 @@ function Mount-DeepImagePair {
 
     Mount-Image -ImageFile $Context.IsoImagePath -MountDir $Context.IsoMountDir -ReadOnly
     Write-Progress -Id 0 -Activity "Deep Scan on $type" -Status "Hashing ISO files" -PercentComplete 30
-    $Context.IsoInternalHashes = Get-FileHashes -RootPath $Context.IsoMountDir -FileFilter $Filter -SourceType "ISO $type"
+    $Context.IsoInternalHashes = Get-FileHashes -RootPath $Context.IsoMountDir -FileFilter $Filter -SourceType "ISO $type"  -SuppressHeader
 
     Write-Log "USB side: mounting and hashing internal $type image..." -Level "INFO" -Context "USB"
     Write-Progress -Id 0 -Activity "Deep Scan on $type" -Status "Mounting USB image" -PercentComplete 50
     Mount-Image -ImageFile $Context.UsbImagePath -MountDir $Context.UsbMountDir -ReadOnly -IsSplit:$Context.IsSplit -SwmPattern $Context.UsbSwmPattern
     Write-Progress -Id 0 -Activity "Deep Scan on $type" -Status "Hashing USB files" -PercentComplete 70
-    $Context.UsbInternalHashes = Get-FileHashes -RootPath $Context.UsbMountDir -FileFilter $Filter -SourceType "USB $type"
+    $Context.UsbInternalHashes = Get-FileHashes -RootPath $Context.UsbMountDir -FileFilter $Filter -SourceType "USB $type" -SuppressHeader
 
     # Diff sets (non-mounting work)
     $Context.Modified = @{}
@@ -1133,11 +1310,9 @@ function Mount-DeepImagePair {
 
     $Context.Extra = $Context.UsbInternalHashes.Keys | Where-Object { -not $Context.IsoInternalHashes.ContainsKey($_) }
 
-    # New: log & record internal summary
+    # Record internal summary for final reporting (no per-phase log here;
+    # we print a BOOT/INSTALL section once at the end based on ScanSummary)
     $t = $Context.Type.ToUpper()
-
-    Write-Log "Internal ${t} summary: Modified=$($Context.Modified.Count), Extra=$($Context.Extra.Count), Missing=$($Context.Missing.Count)" `
-             -Level "INFO" -Context $t
 
     if (-not $script:ScanSummary) { $script:ScanSummary = @{} }
     $script:ScanSummary[$t] = @{
@@ -1145,7 +1320,7 @@ function Mount-DeepImagePair {
         Extra    = $Context.Extra.Count
         Missing  = $Context.Missing.Count
         Green    = 0
-        Orange   = 0
+        Yellow   = 0
         Red      = 0
     }
 
@@ -1165,22 +1340,25 @@ function Analyze-DeepImageDifferences {
     $missing  = $Context.Missing
     $extra    = $Context.Extra
 
-    $greenInt = 0; $orangeInt = 0; $redInt = 0
+    $greenInt = 0; $yellowInt = 0; $redInt = 0
     $validCertCount = 0; $noCertCount = 0; $resCount = 0
 
     $diffFiles = ($modified.Keys + $extra) |
                 Where-Object { -not [string]::IsNullOrWhiteSpace($_) }
 
-    $results = @{ Green = @(); Orange = @(); Red = @() }
+    $results = @{ Green = @(); Yellow = @(); Red = @() }
 
     if ($diffFiles.Count -eq 0) {
         if (-not $script:ScanSummary) { $script:ScanSummary = @{} }
+
+        $totalInternal = $Context.IsoInternalHashes.Count
+
         $script:ScanSummary[$type] = @{
-            Modified = $modified.Count
-            Extra    = $extra.Count
-            Missing  = $missing.Count
-            Green    = 0
-            Orange   = 0
+            Modified = 0
+            Extra    = 0
+            Missing  = 0
+            Green    = $totalInternal   # all internal files matched
+            Yellow   = 0
             Red      = 0
         }
 
@@ -1189,9 +1367,9 @@ function Analyze-DeepImageDifferences {
     }
 
 
-
-    Write-Log "$type (Internal image) Analysis" -NoTimestamp -Level "IMPORTANT" -Header -Context $type
+    # Normal case (there ARE differences)
     Write-Log "Batch-checking signatures for $($diffFiles.Count) differing files in $type..."
+
 
     if ($PSVersionTable.PSVersion.Major -ge 7) {
         $sigResults = $diffFiles | ForEach-Object -Parallel {
@@ -1201,7 +1379,16 @@ function Analyze-DeepImageDifferences {
             $usbPath = Join-Path $using:Context.UsbMountDir $rel
             $ext     = [IO.Path]::GetExtension($usbPath).ToLower()
 
-            if ($ext -in @('.exe', '.dll', '.sys', '.drv', '.cat', '.mui')) {
+           $payloadSigExt = @(
+            '.exe','.dll','.sys','.drv','.ocx','.scr','.cpl','.com',
+            '.msi','.cab','.jar',
+            '.ps1','.psm1','.bat','.cmd','.vbs','.js','.jse','.wsf','.wsh','.hta',
+            '.bin','.dat','.pak',
+            '.cat','.mui',
+            '.efi'
+            )
+
+            if ($payloadSigExt -contains $ext) {
                 $sig = Get-AuthenticodeSignature -LiteralPath $usbPath -ErrorAction SilentlyContinue
                 @{
                     File   = $_
@@ -1218,9 +1405,21 @@ function Analyze-DeepImageDifferences {
         } -ThrottleLimit 8
     } else {
         $sigResults = $diffFiles | ForEach-Object {
-            $usbPath = Join-Path $Context.UsbMountDir $_.TrimStart('\')
-            $ext = [IO.Path]::GetExtension($usbPath).ToLower()
-            if ($ext -in @('.exe', '.dll', '.sys', '.drv', '.cat', '.mui')) {
+            if ([string]::IsNullOrWhiteSpace($_)) { return }
+
+            $rel     = $_.TrimStart('\')
+            $usbPath = Join-Path $Context.UsbMountDir $rel
+            $ext     = [IO.Path]::GetExtension($usbPath).ToLower()
+
+            $payloadSigExt = @(
+                '.exe','.dll','.sys','.drv','.ocx','.scr','.cpl','.com',
+                '.msi','.cab','.jar',
+                '.ps1','.psm1','.bat','.cmd','.vbs','.js','.jse','.wsf','.wsh','.hta',
+                '.bin','.dat','.pak',
+                '.cat','.mui'
+            )
+
+            if ($payloadSigExt -contains $ext) {
                 $sig = Get-AuthenticodeSignature -LiteralPath $usbPath -ErrorAction SilentlyContinue
                 @{
                     File   = $_
@@ -1236,6 +1435,7 @@ function Analyze-DeepImageDifferences {
             }
         }
     }
+
 
     Write-Log "Identifying suspicious modified files in $type that lack valid Microsoft signatures for deeper analysis."
 
@@ -1258,9 +1458,10 @@ function Analyze-DeepImageDifferences {
         $ext = [IO.Path]::GetExtension($file).ToLower()
         if ($ext -eq '.xml') {
             try {
-                $isoContent = Get-Content $isoTempPath -Raw
-                $isoXml = [xml]$isoContent
+                $isoText = Get-Content -LiteralPath $isoTempPath | Out-String
+                $isoXml = [xml]$isoText
                 $isoData[$file] = $isoXml.OuterXml
+
             } catch {
                 Write-Log "Failed to extract XML from ISO '${file}': $($_.Exception.Message)" -Level "WARNING"
             }
@@ -1306,7 +1507,7 @@ function Analyze-DeepImageDifferences {
                     if ($resultAnalysis.Note -match "Valid") { $validCertCount++ }
                 }
                 "WARNING" {
-                    $orangeInt++
+                    $yellowInt++
                     if ($resultAnalysis.Note -match "Resource") { $resCount++ }
                 }
                 "RED" {
@@ -1335,34 +1536,55 @@ function Analyze-DeepImageDifferences {
             Extra    = $extra.Count
             Missing  = $missing.Count
             Green    = 0
-            Orange   = 0
+            Yellow   = 0
             Red      = 0
         }
     }
 
-    $script:ScanSummary[$type].Green  = $greenInt
-    $script:ScanSummary[$type].Orange = $orangeInt
+    $script:ScanSummary[$type].Modified = $modified.Count
+    $script:ScanSummary[$type].Extra    = $extra.Count
+    $script:ScanSummary[$type].Missing  = $missing.Count
+
+    # Compute how many internal files matched exactly
+    $totalInternal  = $Context.IsoInternalHashes.Count
+    $diffCount      = $modified.Count + $missing.Count   # extra files are USB-only
+    $matchingCount  = $totalInternal - $diffCount
+    if ($matchingCount -lt 0) { $matchingCount = 0 }
+
+    $greenTotal = $matchingCount + $greenInt   # clean matches + "green" diffs
+
+    $script:ScanSummary[$type].Green  = $greenTotal
+    $script:ScanSummary[$type].Yellow = $yellowInt
     $script:ScanSummary[$type].Red    = $redInt
 
 
-    Write-Log "Internal ${type}: $greenInt GREEN (incl $validCertCount valid certs), $orangeInt ORANGE (incl $resCount resources), $redInt RED (incl $noCertCount no/invalid cert)"
+    if (-not $script:SectionDetails) { $script:SectionDetails = @{} }
+    $script:SectionDetails[$type] = @{
+        Modified = $modified.Keys
+        Extra    = $extra
+        Missing  = $missing
+    }
+
+
+
+    Write-Log "Internal ${type}: $greenInt GREEN (incl $validCertCount valid certs), $yellowInt YELLOW (incl $resCount resources), $redInt RED (incl $noCertCount no/invalid cert)"
 
 
     if ($missing.Count -gt 0) {
         Write-Log "$($missing.Count) internal files in ISO $type missing on USB (likely version diffs)." -Level "WARNING"
-        $orangeInt += $missing.Count
+        $yellowInt += $missing.Count
     }
     if ($extra.Count -gt 0) {
         Write-Log "$($extra.Count) extra internal files in USB $type (likely version diffs)." -Level "WARNING"
-        $orangeInt += $extra.Count
+        $yellowInt += $extra.Count
     }
 
     if ($redInt -gt 0)   { $results.Red    += "Internal $($type): $redInt high threat" }
-    if ($orangeInt -gt 0){ $results.Orange += "Internal $($type): $orangeInt medium" }
+    if ($yellowInt -gt 0){ $results.Yellow += "Internal $($type): $yellowInt medium" }
     if ($greenInt -gt 0) { $results.Green  += "Internal $($type): $greenInt low" }
-    if ($greenInt + $orangeInt + $redInt -eq 0) { $results.Green += "Internal $($type): No differences" }
+    if ($greenInt + $yellowInt + $redInt -eq 0) { $results.Green += "Internal $($type): No differences" }
 
-    Write-Log "Internal ${type}: $greenInt GREEN (incl $validCertCount valid certs), $orangeInt ORANGE (incl $resCount resources), $redInt RED (incl $noCertCount no/invalid cert)" -Context $type
+    Write-Log "Internal ${type}: $greenInt GREEN (incl $validCertCount valid certs), $yellowInt YELLOW (incl $resCount resources), $redInt RED (incl $noCertCount no/invalid cert)" -Context $type
 
 
     return $results
@@ -1412,13 +1634,13 @@ function Perform-DeepWIMScan {
     Write-Progress -Id 0 -Activity "Deep Scan on $label" -Status "Preparing..." -PercentComplete 0
 
     $ctx = New-DeepWIMScanContext -Type $Type -UsbPath $UsbPath -IsoPath $IsoPath -IsSplit:$IsSplit
-    Write-Log "$label (Internal image) Compare" -NoTimestamp -Level "IMPORTANT" -Header -Context $label
+    Write-Log "$label (Internal image) Processing" -NoTimestamp -Level "IMPORTANT" -Header -Context "OPERATION"
     # Short-circuit if the assembled images are byte-identical
     if ($ctx.UsbWholeHash -and $ctx.IsoWholeHash -and $ctx.UsbWholeHash -eq $ctx.IsoWholeHash) {
         Write-Log "$label hashes match - clean." -Level "GREEN"
         Cleanup-DeepImageContext -Context $ctx
         Write-Progress -Id 0 -Activity "Deep Scan on $label" -Completed
-        return @{ Green = @("\sources\$Type.* (Match)") ; Orange = @(); Red = @() }
+        return @{ Green = @("\sources\$Type.* (Match)") ; Yellow = @(); Red = @() }
     } else {
         Write-Log "$label hashes differ or couldn't compute - deep scan enabled." -Level "WARNING"
     }
@@ -1442,13 +1664,22 @@ function Perform-DeepWIMScan {
         return $results
 
     } catch {
+        if ($_.Exception -is [System.OperationCanceledException]) {
+            Write-Log "Deep WIM scan for ${Type} cancelled by user – cleaning up and aborting." -Level "WARNING"
+
+            # Ensure cleanup, but don't treat as a failure – rethrow so top-level handler runs
+            Cleanup-DeepImageContext -Context $ctx
+            Write-Progress -Id 0 -Activity "Deep Scan on $label" -Completed
+            throw
+        }
+
         Write-Log "Deep scan failed for ${Type}: $($_.Exception.Message)" -Level "RED"
 
         # Ensure cleanup even on failure
         Cleanup-DeepImageContext -Context $ctx
         Write-Progress -Id 0 -Activity "Deep Scan on $label" -Completed
 
-        return @{ Red = @("\sources\$Type.* (Scan failed)") ; Orange = @(); Green = @() }
+        return @{ Red = @("\sources\$Type.* (Scan failed)") ; Yellow = @(); Green = @() }
     }
 }
 
@@ -1460,29 +1691,124 @@ function Verify-ISOHash {
         [string]$KnownHashesFile
     )
     Write-Log "ISO Verification" -NoTimestamp -Level "IMPORTANT" -Header -Context "ISO"
+
     # Load known hashes (hardcoded + optional external)
     $knownISOHashes = @{
         "en-us_windows_11_consumer_editions_version_25h2_updated_nov_2025_x64_dvd_4ace2901.iso" = "AD0D85002B8F6B6A009C335F8AD9A3606D224D215039220E92C390D4C7B5A8CA"
         "en-gb_windows_11_consumer_editions_version_25h2_updated_nov_2025_x64_dvd_4ace2901.iso" = "96D8F01A13874B398A931423E7697A183E9F8436B20BA89B1761B00FF1617B2C"
-        "en-us_windows_11_consumer_editions_version_25h2_x64_dvd_9934ee4c.iso" = "D141F6030FED50F75E2B03E1EB2E53646C4B21E5386047CB860AF5223F102A32"
-        "en-gb_windows_11_consumer_editions_version_25h2_x64_dvd_f18d2cbd.iso" = "BAAEB6C90DD51648154B64C40C9E0C14D93A427F611A1BB49C8077FA2FF73364"
-    }
-    if ($KnownHashesFile -and (Test-Path $KnownHashesFile)) {
-        $externalHashes = Get-Content $KnownHashesFile | ConvertFrom-Json
-        $knownISOHashes += $externalHashes
+        "en-us_windows_11_consumer_editions_version_25h2_x64_dvd_9934ee4c.iso"                  = "D141F6030FED50F75E2B03E1EB2E53646C4B21E5386047CB860AF5223F102A32"
+        "en-gb_windows_11_consumer_editions_version_25h2_x64_dvd_f18d2cbd.iso"                  = "BAAEB6C90DD51648154B64C40C9E0C14D93A427F611A1BB49C8077FA2FF73364"
     }
 
-    # Verify ISO hash
-    $isoHash = (Get-FileHash $ISOPath -Algorithm 'SHA256').Hash.ToUpper()
-    $matchingKey = $knownISOHashes.GetEnumerator() | Where-Object { $_.Value -eq $isoHash } | Select-Object -ExpandProperty Key -First 1
-    if ($matchingKey) {
-        Write-Log "ISO verified as authentic ($matchingKey)." -Level "GREEN"
-    } else {
-        Write-Log "WARNING: ISO hash mismatch. Verify source." -Level "WARNING"
+    if ($KnownHashesFile -and (Test-Path $KnownHashesFile)) {
+        try {
+            $externalHashes = Get-Content $KnownHashesFile | ConvertFrom-Json
+            $knownISOHashes += $externalHashes
+        } catch {
+            Write-Log "Failed to parse external known-hashes file '$KnownHashesFile': $($_.Exception.Message)" -Level "WARNING"
+        }
     }
+
+    try {
+        $isoHash = (Get-FileHash $ISOPath -Algorithm 'SHA256').Hash.ToUpper()
+        $script:ISOHashInfo.Hash = $isoHash
+
+        $matchingKey = $null
+        if ($knownISOHashes.Count -gt 0) {
+            $matchingKey = $knownISOHashes.GetEnumerator() |
+                           Where-Object { $_.Value -eq $isoHash } |
+                           Select-Object -ExpandProperty Key -First 1
+        }
+
+        if ($matchingKey) {
+            $script:ISOHashInfo.Status      = 'KnownGood'
+            $script:ISOHashInfo.MatchedName = $matchingKey
+
+            Write-Log "ISO verified as authentic (matches known hash for '$matchingKey')." -Level "GREEN"
+            Write-Log "ISO SHA256: $isoHash" -Level "INFO"
+        } else {
+            $script:ISOHashInfo.Status      = 'Unknown'
+            $script:ISOHashInfo.MatchedName = $null
+
+            Write-Log "WARNING: ISO SHA256 does not match any built-in known-good hash." -Level "WARNING"
+            Write-Log "ISO SHA256: $isoHash" -Level "INFO"
+            Write-Log "If this ISO was not downloaded directly from Microsoft, double-check the source or compare against official hashes." -Level "WARNING"
+        }
+    } catch {
+        $script:ISOHashInfo.Status      = 'Error'
+        $script:ISOHashInfo.MatchedName = $null
+        $script:ISOHashInfo.Hash        = $null
+
+        Write-Log "Failed to compute ISO hash: $($_.Exception.Message)" -Level "RED"
+    }
+
     # Return the trimmed ISOPath for use in main script
     return $ISOPath
 }
+
+
+
+function Close-ExplorerForDrive {
+    param(
+        [Parameter(Mandatory = $true)]
+        [ValidatePattern('^[A-Z]:$')]
+        [string]$Drive
+    )
+
+    try {
+        $driveRoot = $Drive.ToUpper().TrimEnd('\')  # "F:"
+        Write-Log "Attempting to close Explorer windows for drive $driveRoot..." -Level "INFO"
+
+        # Try for up to ~5 seconds to catch the auto-open window
+        for ($attempt = 1; $attempt -le 10; $attempt++) {
+            $closedAny = $false
+
+            $shell   = New-Object -ComObject Shell.Application
+            $windows = $shell.Windows()
+            if (-not $windows) {
+                Start-Sleep -Milliseconds 500
+                continue
+            }
+
+            foreach ($w in $windows) {
+                try {
+                    $folder = $w.Document.Folder
+                    if (-not $folder) { continue }
+
+                    $path = $folder.Self.Path  # e.g. "F:\" or "F:\Sources"
+                    if ([string]::IsNullOrWhiteSpace($path)) { continue }
+
+                    $norm = $path.ToUpper().TrimEnd('\')  # Normalise "F:\" -> "F:"
+                    if ($norm -match '^[A-Z]:$') {
+                        Write-Log "Explorer window candidate: '$path'" -Level "INFO"
+                    }
+
+                    # Match exact drive root or anything under it
+                    if ($norm -eq $driveRoot -or $norm.StartsWith($driveRoot + "\")) {
+                        Write-Log "Closing Explorer window for mounted ISO path: $path (attempt $attempt)" -Level "INFO"
+                        $w.Quit()
+                        $closedAny = $true
+                    }
+                } catch {
+                    # Ignore weird COM windows
+                    continue
+                }
+            }
+
+            if ($closedAny) {
+                Write-Log "Finished closing Explorer windows for $driveRoot." -Level "INFO"
+                break
+            }
+
+            # Nothing matched this time – wait a bit and let Explorer catch up
+            Start-Sleep -Milliseconds 500
+        }
+    } catch {
+        Write-Log "Failed to inspect/close Explorer windows: $($_.Exception.Message)" -Level "WARNING"
+    }
+}
+
+
 
 function Mount-ISO {
     param (
@@ -1516,6 +1842,12 @@ function Mount-ISO {
 
         $script:ISOContext.DriveLetter = $isoDrive
         $script:ISOContext.MountedByScript = $true
+
+        Start-Sleep -Milliseconds 500   # let autoplay/Explorer react
+        Close-ExplorerForDrive -Drive $isoDrive
+
+        # Politely ask Windows to give focus back to this console
+        Focus-ConsoleWindow
         
         # Record this ISO as script-mounted in persistent state
         $state = Get-ISOState
@@ -1536,7 +1868,41 @@ function Mount-ISO {
     return $script:ISOContext.DriveLetter
 }
 
+function Focus-ConsoleWindow {
+    try {
+        $sig = @"
+using System;
+using System.Runtime.InteropServices;
+
+public static class ConsoleFocus {
+    [DllImport("kernel32.dll")]
+    public static extern IntPtr GetConsoleWindow();
+
+    [DllImport("user32.dll")]
+    public static extern bool SetForegroundWindow(IntPtr hWnd);
+}
+"@
+
+        # Only add the type once per session
+        if (-not ("ConsoleFocus" -as [type])) {
+            Add-Type -TypeDefinition $sig -ErrorAction SilentlyContinue | Out-Null
+        }
+
+        $hWnd = [ConsoleFocus]::GetConsoleWindow()
+        if ($hWnd -ne [IntPtr]::Zero) {
+            [ConsoleFocus]::SetForegroundWindow($hWnd) | Out-Null
+        }
+    } catch {
+        Write-Log "Failed to refocus console window: $($_.Exception.Message)" -Level "WARNING"
+    }
+}
+
+
 function Dismount-ISO {
+    param(
+        [switch]$Quiet
+    )
+
     # Safely dismount only the ISO we know about
     if (-not $script:ISOContext.FullPath) {
         # Nothing tracked, nothing to do
@@ -1549,7 +1915,9 @@ function Dismount-ISO {
     try {
         $img = Get-DiskImage -ImagePath $isoPath -ErrorAction SilentlyContinue
         if (-not $img -or -not $img.Attached) {
-            Write-Log "No attached ISO found for $isoPath (maybe already dismounted)." -Level "WARNING"
+            if (-not $Quiet) {
+                Write-Log "No attached ISO found for $isoPath (maybe already dismounted)." -Level "WARNING"
+            }
             return
         }
 
@@ -1558,13 +1926,18 @@ function Dismount-ISO {
             $prompt = "The ISO `"$isoPath`" is mounted as drive $drive but was not mounted by this script. Do you want to dismount it now? (Y/N, default N)"
             $choice = Read-Host $prompt
             if ($choice -ne 'Y' -and $choice -ne 'y') {
-                Write-Log "Leaving ISO mounted at $drive at user request."
+                if (-not $Quiet) {
+                    Write-Log "Leaving ISO mounted at $drive at user request."
+                }
                 return
             }
         }
 
-        Dismount-DiskImage -ImagePath $isoPath -ErrorAction Stop
-        Write-Log "ISO dismounted: $isoPath"
+        Dismount-DiskImage -ImagePath $isoPath -ErrorAction Stop | Out-Null
+
+        if (-not $Quiet) {
+            Write-Log "ISO dismounted: $isoPath"
+        }
 
         # Remove from persistent state (if present)
         $state = Get-ISOState
@@ -1574,6 +1947,7 @@ function Dismount-ISO {
         }
 
     } catch {
+        # Dismount failure is *always* interesting – keep this loud
         Write-Log "Dismount failed for ${isoPath}: $($_.Exception.Message)" -Level "WARNING"
     } finally {
         # Clear tracked context
@@ -1586,54 +1960,218 @@ function Dismount-ISO {
 }
 
 
+
 function Write-FinalSummary {
     param(
         [array]$RedItems,
-        [array]$OrangeItems,
+        [array]$YellowItems,
         [array]$GreenItems,
         [int]$MissingRootCount
     )
 
-    Write-Log "Overall Summary" -NoTimestamp -Level "IMPORTANT" -Header -Context "SUMMARY"
+    # Build per-section threat from ScanSummary
+    $sections = @('ROOT','BOOT','INSTALL')
+    $sectionResults = @{}
 
-    foreach ($key in @('BOOT','INSTALL','ROOT')) {
+    foreach ($key in $sections) {
         if (-not $script:ScanSummary.ContainsKey($key)) { continue }
-
         $s = $script:ScanSummary[$key]
-        $label = switch ($key) {
-            'BOOT'    { 'BOOT (Internal image)' }
-            'INSTALL' { 'INSTALL (Internal image)' }
-            'ROOT'    { 'ROOT (Surface files)' }
-            default   { $key }
+
+        $threat =
+            if ($s.Red -gt 0 -or ($key -eq 'ROOT' -and $MissingRootCount -gt 0)) { 'RED' }
+            elseif ($s.Yellow -gt 0) { 'YELLOW' }
+            elseif ($s.Modified -eq 0 -and $s.Extra -eq 0 -and $s.Missing -eq 0) { 'GREEN' }
+            else { 'GREEN' }
+
+        $sectionResults[$key] = @{
+            Threat   = $threat
+            Modified = $s.Modified
+            Extra    = $s.Extra
+            Missing  = $s.Missing
+        }
+    }
+
+    # Overall verdict: max severity across sections
+    $severityRank = @{ 'GREEN' = 0; 'YELLOW' = 1; 'RED' = 2 }
+    $overall = 'GREEN'
+    foreach ($sec in $sectionResults.Keys) {
+        $t = $sectionResults[$sec].Threat
+        if ($severityRank[$t] -gt $severityRank[$overall]) {
+            $overall = $t
+        }
+    }
+
+    $overallLevel = switch ($overall) {
+        'RED'    { 'RED' }
+        'YELLOW' { 'WARNING' }
+        default  { 'GREEN' }
+    }
+
+    $overallIcon = switch ($overall) {
+        'RED'    { '[FAIL]' }
+        'YELLOW' { '[WARN]' }
+        default  { '[ OK ]' }
+    }
+
+    Write-Log "" -NoTimestamp
+    Write-Log "USB Verification Summary" -NoTimestamp -Level "IMPORTANT" -Header -Context "RESULT"
+    Write-Log "==================== FINAL RESULT ====================" -Level "INFO" -Context "RESULT"
+
+    # ISO hash / integrity summary (if we managed to compute it)
+    if ($script:ISOHashInfo.Hash) {
+        $isoStatusText = switch ($script:ISOHashInfo.Status) {
+            'KnownGood' { "KNOWN GOOD (matches '$($script:ISOHashInfo.MatchedName)')" }
+            'Unknown'   { "UNKNOWN – hash not in known-good list" }
+            'Error'     { "HASH ERROR – see earlier log entries" }
+            default     { $script:ISOHashInfo.Status }
         }
 
-        $status =
-            if ($s.Red -gt 0 -or ($key -eq 'ROOT' -and $MissingRootCount -gt 0)) { 'RED' }
-            elseif ($s.Orange -gt 0) { 'ORANGE' }
-            elseif ($s.Green -gt 0) { 'GREEN' }
-            else { 'GREEN' }  # no diffs => effectively clean
+        $isoLevel = switch ($script:ISOHashInfo.Status) {
+            'KnownGood' { 'GREEN' }
+            'Unknown'   { 'WARNING' }
+            'Error'     { 'RED' }
+            default     { 'INFO' }
+        }
 
-        $levelForLog = switch ($status) {
+        Write-Log ("ISO SHA256: {0}" -f $script:ISOHashInfo.Hash) -Level "INFO" -Context "RESULT"
+        Write-Log ("ISO integrity: {0}" -f $isoStatusText) -Level $isoLevel -Context "RESULT"
+
+        if ($script:ISOHashInfo.Status -eq 'Unknown') {
+            Write-Log "Note: ISO hash is not in the built-in known-good list. If you did not download this ISO directly from Microsoft, re-check the download source or compare with official Microsoft hashes." -Level "WARNING" -Context "RESULT"
+        }
+    }
+
+    Write-Log "$overallIcon Overall verdict: $overall" -Level $overallLevel -Context "RESULT"
+    Write-Log "------------------------------------------------------" -Level "INFO" -Context "RESULT"
+
+    foreach ($key in @('ROOT','BOOT','INSTALL')) {
+        if (-not $sectionResults.ContainsKey($key)) { continue }
+        $r = $sectionResults[$key]
+
+        $label = switch ($key) {
+            'ROOT'    { 'ROOT (Surface files)' }
+            'BOOT'    { 'BOOT (Internal image)' }
+            'INSTALL' { 'INSTALL (Internal image)' }
+        }
+
+        $icon = switch ($r.Threat) {
+            'RED'    { '[FAIL]' }
+            'YELLOW' { '[WARN]' }
+            default  { '[ OK ]' }
+        }
+
+        $baseLine =
+            if ($r.Modified -eq 0 -and $r.Extra -eq 0 -and $r.Missing -eq 0) {
+                "$icon ${label}: $($r.Threat) | No differences"
+            } else {
+                "$icon ${label}: $($r.Threat) | Modified: $($r.Modified), Extra: $($r.Extra), Missing: $($r.Missing)"
+            }
+
+        $level = switch ($r.Threat) {
             'RED'    { 'RED' }
-            'ORANGE' { 'WARNING' }
+            'YELLOW' { 'WARNING' }
             default  { 'GREEN' }
         }
 
-        Write-Log "${label}:" -NoTimestamp -Level "IMPORTANT" -Context "SUMMARY"
-        Write-Log "  Modified: $($s.Modified), Extra: $($s.Extra), Missing: $($s.Missing)" -Level "INFO" -Context "SUMMARY"
-        Write-Log "  Threat: $status (Green=$($s.Green), Orange=$($s.Orange), Red=$($s.Red))" -Level $levelForLog -Context "SUMMARY"
-    }
+        Write-Log $baseLine -Level $level -Context "RESULT"
+        # Show per-section colour breakdown if available (so Yellow is visible in FINAL RESULT)
+        if ($script:ScanSummary.ContainsKey($key)) {
+            $s = $script:ScanSummary[$key]
 
-    Write-Log "Colour-coded items (aggregated):" -NoTimestamp -Level "IMPORTANT" -Context "SUMMARY"
-    if ($RedItems.Count -gt 0)    { Write-Log "RED: $($RedItems -join ', ')"    -Level "RED" }
-    if ($OrangeItems.Count -gt 0) { Write-Log "ORANGE: $($OrangeItems -join ', ')" -Level "WARNING" }
-    if ($GreenItems.Count -gt 0)  { Write-Log "GREEN: $($GreenItems -join ', ')" -Level "GREEN" }
+            if ($key -eq 'ROOT') {
+                $imageCount = if ($s.ContainsKey('Images')) { $s.Images } else { 0 }
+
+                if ($imageCount -gt 0) {
+                    Write-Log ("           Breakdown: Green={0}, Yellow={1}, Red={2}, Images={3}" -f $s.Green, $s.Yellow, $s.Red, $imageCount) -Level "INFO" -Context "RESULT"
+                } else {
+                    Write-Log ("           Breakdown: Green={0}, Yellow={1}, Red={2}" -f $s.Green, $s.Yellow, $s.Red) -Level "INFO" -Context "RESULT"
+                }
+            } else {
+                Write-Log ("           Breakdown: Green={0}, Yellow={1}, Red={2}" -f $s.Green, $s.Yellow, $s.Red) -Level "INFO" -Context "RESULT"
+            }
+        }
+
+        # Extra explanation & filenames only if there ARE differences
+        if ($r.Modified -ne 0 -or $r.Extra -ne 0 -or $r.Missing -ne 0) {
+            $files = @()
+            if ($script:SectionDetails.ContainsKey($key)) {
+                $d = $script:SectionDetails[$key]
+                $files = @($d.Modified + $d.Extra + $d.Missing | Where-Object { $_ -and $_.Trim() -ne '' } | Select-Object -Unique)
+            }
+
+            if ($files.Count -gt 0) {
+                $maxShow = [math]::Min(5, $files.Count)
+                $preview = $files[0..($maxShow-1)] -join ', '
+                if ($files.Count -gt $maxShow) {
+                    $preview += ", +$($files.Count - $maxShow) more"
+                }
+                Write-Log ("           Files: {0}" -f $preview) -Level "INFO" -Context "RESULT"
+
+                # Simple type-based reason
+                # Detailed type-based reason tuned by severity
+                $execExt   = @('.exe','.dll','.sys','.drv','.ocx','.scr')
+                $scriptExt = @('.ps1','.psm1','.bat','.cmd','.vbs','.js','.jse','.wsf')
+                $binExt    = @('.bin','.dat','.pak','.cab')
+                $configExt = @('.xml','.inf','.ini','.cfg','.sdb','.manifest','.mui','.cat')
+                $docExt    = @('.txt','.log','.md','.rtf')
+
+                $allExts = $files | ForEach-Object { [IO.Path]::GetExtension($_).ToLower() } |
+                           Where-Object { $_ -ne '' } | Select-Object -Unique
+
+                $execHit   = @($allExts | Where-Object { $execExt   -contains $_ })
+                $scriptHit = @($allExts | Where-Object { $scriptExt -contains $_ })
+                $binHit    = @($allExts | Where-Object { $binExt    -contains $_ })
+                $configHit = @($allExts | Where-Object { $configExt -contains $_ })
+                $docHit    = @($allExts | Where-Object { $docExt    -contains $_ })
+
+                $reasonParts = @()
+
+                if ($execHit.Count -gt 0) {
+                    $sample = $execHit[0..([math]::Min(1, $execHit.Count-1))] -join ', '
+                    $reasonParts += "includes executable/driver files (e.g. $sample)"
+                }
+                if ($scriptHit.Count -gt 0) {
+                    $sample = $scriptHit[0..([math]::Min(1, $scriptHit.Count-1))] -join ', '
+                    $reasonParts += "includes script files (e.g. $sample)"
+                }
+                if ($binHit.Count -gt 0) {
+                    $sample = $binHit[0..([math]::Min(1, $binHit.Count-1))] -join ', '
+                    $reasonParts += "includes binary payload-style files (e.g. $sample)"
+                }
+
+                # Lower-risk categories (only if we don't already have a wall of high-risk parts)
+                if ($configHit.Count -gt 0) {
+                    $sample = $configHit[0..([math]::Min(1, $configHit.Count-1))] -join ', '
+                    $reasonParts += "has configuration/metadata changes (e.g. $sample)"
+                }
+                if ($docHit.Count -gt 0 -and $execHit.Count -eq 0 -and $scriptHit.Count -eq 0 -and $binHit.Count -eq 0) {
+                    # Only call out docs explicitly when there’s nothing scarier present
+                    $sample = $docHit[0..([math]::Min(1, $docHit.Count-1))] -join ', '
+                    $reasonParts += "only affects text/log-style files (e.g. $sample)"
+                }
+
+                if ($reasonParts.Count -eq 0) {
+                    $reasonParts += "involves miscellaneous file types (no clear category)"
+                }
+
+                # Keep the message tight: at most 2 parts
+                if ($reasonParts.Count -gt 2) {
+                    $reasonParts = $reasonParts[0..1]
+                }
+
+                $reason = "Reason ($($r.Threat)): " + ($reasonParts -join '; ') + "."
+                Write-Log ("           {0}" -f $reason) -Level "INFO" -Context "RESULT"
+
+            }
+        }
+    }
 
     if ($MissingRootCount -gt 0) {
-        Write-Log "Missing root files: $MissingRootCount (see ROOT section above; may be expected for customised media)." -Level "WARNING" -Context "SUMMARY"
+        Write-Log "Note: $MissingRootCount surface files are missing from USB compared with ISO (may be expected for customised media)." -Level "WARNING" -Context "RESULT"
     }
-}
 
+    Write-Log "======================================================" -Level "INFO" -Context "RESULT"
+}
 
 
 
@@ -1645,43 +2183,49 @@ function Write-FinalSummary {
 ########################################################################################## Main flow
 ##########################################################################################
 ##########################################################################################
+
+
 $startTime = Get-Date
-Write-Log "Starting Operations - Press Ctrl+C to interrupt."
+Show-StartupBanner -StartTime $startTime
+
+# Treat Ctrl+C as keystroke so our Check-ForInterrupt can see it
 [Console]::TreatControlCAsInput = $true
 
+try {
+    # ===== MAIN BODY START =====
 
-$ISOPath = $ISOPath.Trim('"', "'")
+    $ISOPath = $ISOPath.Trim('"', "'")
 
-if (-not (Test-Path $ISOPath -PathType Leaf)) {
-    Write-Log "Invalid ISOPath: $ISOPath" -Level "ERROR"
-    exit 1
-}
+    if (-not (Test-Path $ISOPath -PathType Leaf)) {
+        Write-Log "Invalid ISOPath: $ISOPath" -Level "ERROR"
+        exit 1
+    }
 
-$ISOPath = (Resolve-Path -LiteralPath $ISOPath).ProviderPath
-Write-Log "Using ISO: $ISOPath"
+    $ISOPath = (Resolve-Path -LiteralPath $ISOPath).ProviderPath
+    Write-Log "Using ISO: $ISOPath"
 
-# Environment check first so cleanup has $HasHandleExe
-$envCheck = Test-Environment -ReassembleWIM:$ReassembleWIM -DeepScanWIM:$DeepScanWIM
-$ReassembleWIM = $envCheck.ReassembleWIM
-$DeepScanWIM   = $envCheck.DeepScanWIM
-$HasHandleExe  = $envCheck.HasHandleExe
+    # Environment check first so cleanup has $HasHandleExe
+    $envCheck = Test-Environment -ReassembleWIM:$ReassembleWIM -DeepScanWIM:$DeepScanWIM
+    $ReassembleWIM = $envCheck.ReassembleWIM
+    $DeepScanWIM   = $envCheck.DeepScanWIM
+    $HasHandleExe  = $envCheck.HasHandleExe
 
-# Initial cleanup
-Clean-TempMounts
+    # Initial cleanup
+    Clean-TempMounts
 
-# clean up leftover ISOs from previous usb-verifier runs (if any)
-Cleanup-PreviousScriptISOs
+    # clean up leftover ISOs from previous usb-verifier runs (if any)
+    Cleanup-PreviousScriptISOs
 
-# Add this call in the main flow, right after Clean-TempMounts:
-$ISOPath = Verify-ISOHash -ISOPath $ISOPath -KnownHashesFile $KnownHashesFile
-$isoDrive = Mount-ISO -ISOPath $ISOPath
+    # Add this call in the main flow, right after Clean-TempMounts:
+    $ISOPath = Verify-ISOHash -ISOPath $ISOPath -KnownHashesFile $KnownHashesFile
+    $isoDrive = Mount-ISO -ISOPath $ISOPath
 
 # Hash ISO and USB
 $isoHashes = Get-FileHashes -RootPath $isoDrive -SourceType "ISO"
 $usbHashes = Get-FileHashes -RootPath $USBDrive -SourceType "USB"
 
 # Detect split
-Write-Log "Checking for multiple files" -NoTimestamp -Level "IMPORTANT" -Header -Context $type
+Write-Log "Checking for multiple files" -NoTimestamp -Level "IMPORTANT" -Header -Context "OPERATION"
 $isSplit = ($usbHashes.Keys -match '\\sources\\install\d*\.swm$').Count -gt 0 -and -not $usbHashes.ContainsKey('\sources\install.wim')
 Write-Log "Split detected: $isSplit"
 
@@ -1697,14 +2241,14 @@ $isoInstall = "$isoDrive\sources\install$isoInstallExt"
 $usbInstall = "$USBDrive\sources\install$usbInstallExt"
 
 $redFiles = @()
-$orangeFiles = @()
+$yellowFiles = @()
 $greenFiles = @()
 
 if ($DeepScanWIM) {
     if ($isoBoot -and $usbBoot) {
         $bootResults = Perform-DeepWIMScan -Type "boot" -UsbPath $usbBoot -IsoPath $isoBoot
         $greenFiles += $bootResults.Green
-        $orangeFiles += $bootResults.Orange
+        $yellowFiles += $bootResults.Yellow
         $redFiles += $bootResults.Red
     } else {
         Write-Log "boot.wim missing in ISO or USB." -Level "RED"
@@ -1713,7 +2257,7 @@ if ($DeepScanWIM) {
     if ($isoInstallExt -and $usbInstallExt) {
         $installResults = Perform-DeepWIMScan -Type "install" -UsbPath $usbInstall -IsoPath $isoInstall -IsSplit:$isSplit
         $greenFiles += $installResults.Green
-        $orangeFiles += $installResults.Orange
+        $yellowFiles += $installResults.Yellow
         $redFiles += $installResults.Red
     } else {
         Write-Log "install.* missing in ISO or USB." -Level "RED"
@@ -1721,17 +2265,54 @@ if ($DeepScanWIM) {
     }
 } else {
     Write-Log "NOTICE: DeepScanWIM not enabled. WIM/ESD/SWM may differ (common for MCT). Use -DeepScanWIM for full check." -Level "IMPORTANT"
-    if ($usbBoot -and $isoHashes['\sources\boot.wim'] -ne $usbHashes['\sources\boot.wim']) { $orangeFiles += "\sources\boot.wim (Mismatch - typical for MCT)" }
-    if ($isSplit) { $orangeFiles += "\sources\install*.swm (Split detected - typical for MCT on FAT32)" }
-    elseif ($usbInstallExt -and $isoHashes["\sources\install$isoInstallExt"] -ne $usbHashes["\sources\install$usbInstallExt"]) { $orangeFiles += "\sources\install$usbInstallExt (Mismatch - typical for MCT)" }
+    if ($usbBoot -and $isoHashes['\sources\boot.wim'] -ne $usbHashes['\sources\boot.wim']) { $yellowFiles += "\sources\boot.wim (Mismatch - typical for MCT)" }
+    if ($isSplit) { $yellowFiles += "\sources\install*.swm (Split detected - typical for MCT on FAT32)" }
+    elseif ($usbInstallExt -and $isoHashes["\sources\install$isoInstallExt"] -ne $usbHashes["\sources\install$usbInstallExt"]) { $yellowFiles += "\sources\install$usbInstallExt (Mismatch - typical for MCT)" }
 }
 
-# Non-WIM comparison
-$wimExcludes = @('\sources\boot.wim', '\sources\install.*', '\sources\product.ini')
+# Cleanup
+Clean-TempMounts
+
+
+# ROOT (Surface files) comparison
+# We exclude image containers here:
+#   - \sources\boot.wim
+#   - \sources\install.wim / install.esd / install*.swm
+# because their contents are analysed in the BOOT/INSTALL deep scan.
+$wimExcludes = @(
+    '\sources\boot.wim',
+    '\sources\install.wim',
+    '\sources\install.esd',
+    '\sources\install*.swm'
+)
+
 $filteredIsoHashes = @{}
-$isoHashes.GetEnumerator() | Where-Object { $exclude = $false; foreach ($ex in $wimExcludes) { if ($_.Key -like $ex) { $exclude = $true; break } }; -not $exclude } | ForEach-Object { $filteredIsoHashes[$_.Key] = $_.Value }
+$isoHashes.GetEnumerator() | Where-Object {
+    $exclude = $false
+    foreach ($ex in $wimExcludes) {
+        if ($_.Key -like $ex) { $exclude = $true; break }
+    }
+    -not $exclude
+} | ForEach-Object {
+    $filteredIsoHashes[$_.Key] = $_.Value
+}
+
 $filteredUsbHashes = @{}
-$usbHashes.GetEnumerator() | Where-Object { $exclude = $false; foreach ($ex in $wimExcludes) { if ($_.Key -like $ex) { $exclude = $true; break } }; -not $exclude } | ForEach-Object { $filteredUsbHashes[$_.Key] = $_.Value }
+$usbHashes.GetEnumerator() | Where-Object {
+    $exclude = $false
+    foreach ($ex in $wimExcludes) {
+        if ($_.Key -like $ex) { $exclude = $true; break }
+    }
+    -not $exclude
+} | ForEach-Object {
+    $filteredUsbHashes[$_.Key] = $_.Value
+}
+
+# How many USB files did we exclude from ROOT comparison (WIM/ESD/SWM containers)?
+$script:RootImageContainerCount = $usbHashes.Count - $filteredUsbHashes.Count
+if ($script:RootImageContainerCount -gt 0) {
+    Write-Log "Note: $($script:RootImageContainerCount) image container file(s) (boot/install WIM/ESD/SWM) were excluded from surface ROOT comparison and analysed via deep WIM scan instead." -Context "ROOT"
+}
 
 $modifiedFiles = @{}
 $missingFiles = @()
@@ -1741,14 +2322,9 @@ foreach ($key in $filteredIsoHashes.Keys) {
     elseif ($filteredIsoHashes[$key] -ne $filteredUsbHashes[$key]) { $modifiedFiles[$key] = 'Modified' }
 }
 
-# If split and deep scan, treat install*.swm as handled
-if ($isSplit -and $DeepScanWIM) {
-    $extraFiles = $extraFiles | Where-Object { $_ -notmatch '\\sources\\install\d*\.swm$' }
-    $orangeFiles += "\sources\install*.swm (Handled in deep scan)"
-}
 
 # Header
-Write-Log "ROOT (Surface files) Analysis" -NoTimestamp -Level "IMPORTANT" -Header -Context "ROOT"
+Write-Log "ROOT (Surface files) Analysis" -NoTimestamp -Level "IMPORTANT" -Header -Context "OPERATION"
 Write-Log "Non-WIM summary: ISO files $($filteredIsoHashes.Count), USB $($filteredUsbHashes.Count), Modified $($modifiedFiles.Count), Extra $($extraFiles.Count), Missing $($missingFiles.Count)" -Context "ROOT"
 
 if ($missingFiles.Count -gt 0) {
@@ -1760,7 +2336,7 @@ if ($missingFiles.Count -gt 0) {
 }
 
 # Tiered analysis for root modified/extra
-$greenRoot = 0; $orangeRoot = 0; $redRoot = 0
+$greenRoot = 0; $yellowRoot = 0; $redRoot = 0
 $validCertRoot = 0; $noCertRoot = 0; $resRoot = 0
 $filesToAnalyze = $modifiedFiles.Keys + $extraFiles
 
@@ -1770,16 +2346,29 @@ if ($filesToAnalyze.Count -gt 0) {
         $sigResults = $filesToAnalyze | ForEach-Object -Parallel {
             $usbPath = "$using:USBDrive$_"
             $ext = [IO.Path]::GetExtension($usbPath).ToLower()
-            if ($ext -in @('.exe', '.dll', '.sys', '.drv', '.cat', '.mui')) {
+
+            $payloadSigExt = @(
+                '.exe','.dll','.sys','.drv','.ocx','.scr','.cpl','.com',
+                '.msi','.cab','.jar',
+                '.ps1','.psm1','.bat','.cmd','.vbs','.js','.jse','.wsf','.wsh','.hta',
+                '.bin','.dat','.pak',
+                '.cat','.mui',
+                '.efi'
+            )
+
+
+
+
+            if ($payloadSigExt -contains $ext) {
                 $sig = Get-AuthenticodeSignature -LiteralPath $usbPath -ErrorAction SilentlyContinue
                 @{
-                    File = $_
+                    File   = $_
                     Status = $sig.Status
                     Signer = $sig.SignerCertificate.Subject
                 }
             } else {
                 @{
-                    File = $_
+                    File   = $_
                     Status = "NonPE"
                     Signer = $null
                 }
@@ -1789,16 +2378,26 @@ if ($filesToAnalyze.Count -gt 0) {
         $sigResults = $filesToAnalyze | ForEach-Object {
             $usbPath = "$USBDrive$_"
             $ext = [IO.Path]::GetExtension($usbPath).ToLower()
-            if ($ext -in @('.exe', '.dll', '.sys', '.drv', '.cat', '.mui')) {
+
+           $payloadSigExt = @(
+                '.exe','.dll','.sys','.drv','.ocx','.scr','.cpl','.com',
+                '.msi','.cab','.jar',
+                '.ps1','.psm1','.bat','.cmd','.vbs','.js','.jse','.wsf','.wsh','.hta',
+                '.bin','.dat','.pak',
+                '.cat','.mui',
+                '.efi'
+            )
+
+            if ($payloadSigExt -contains $ext) {
                 $sig = Get-AuthenticodeSignature -LiteralPath $usbPath -ErrorAction SilentlyContinue
                 @{
-                    File = $_
+                    File   = $_
                     Status = $sig.Status
                     Signer = $sig.SignerCertificate.Subject
                 }
             } else {
                 @{
-                    File = $_
+                    File   = $_
                     Status = "NonPE"
                     Signer = $null
                 }
@@ -1814,7 +2413,7 @@ if ($filesToAnalyze.Count -gt 0) {
         $percent = if ($totalDiff -gt 0) { [math]::Round(($i / $totalDiff) * 100) } else { 100 }
         Write-Progress -Activity "Analyzing root differences" -Status "$percent%" -PercentComplete $percent
 
-        $file = $result.File
+        $file   = $result.File
         $status = if ($modifiedFiles.ContainsKey($file)) { 'Modified' } else { 'Extra' }
         $usbPath = "$USBDrive$file"
         $isoPath = if ($status -eq 'Modified') { "$isoDrive$file" } else { $null }
@@ -1825,20 +2424,22 @@ if ($filesToAnalyze.Count -gt 0) {
             $validSigDiffCountRoot++  # Increment new counter
         } else {
             $isoData = $null
-            if ($status -eq 'Modified') {
-                $ext = [IO.Path]::GetExtension($file).ToLower()
-                if ($ext -eq '.xml') {
-                    $isoData = ([xml](Get-Content $isoPath -Raw)).OuterXml
+            if ($status -eq 'Modified' -and $isoPath -and (Test-Path $isoPath)) {
+                $extInner = [IO.Path]::GetExtension($file).ToLower()
+                if ($extInner -eq '.xml') {
+                    $isoText = Get-Content -LiteralPath $isoPath | Out-String
+                    $isoData = ([xml]$isoText).OuterXml
                 } else {
                     $isoData = Extract-PrintableStrings $isoPath
                 }
             }
+
             $resultAnalysis = Analyze-File -FilePath $usbPath -IsoFilePath $null -Context "Root" -Status $status -IsoData $isoData
 
             switch ($resultAnalysis.Threat) {
-                "GREEN" { $greenRoot++; if ($resultAnalysis.Note -match "Valid") { $validCertRoot++ } }
-                "WARNING" { $orangeRoot++; }  # Removed unused "Resource" match - add back if needed with correct condition
-                "RED" { $redRoot++; if ($resultAnalysis.Note -match "Invalid|Not signed") { $noCertRoot++ } }
+                "GREEN"   { $greenRoot++; if ($resultAnalysis.Note -match "Valid") { $validCertRoot++ } }
+                "WARNING" { $yellowRoot++; }
+                "RED"     { $redRoot++; if ($resultAnalysis.Note -match "Invalid|Not signed") { $noCertRoot++ } }
             }
 
             if ($resultAnalysis.Threat -ne "GREEN") {
@@ -1848,53 +2449,111 @@ if ($filesToAnalyze.Count -gt 0) {
     }
     Write-Progress -Activity "Analyzing root differences" -Completed
 
-    # New summary log for valid sig diffs in root
+    # Summary log for valid sig diffs in root
     if ($validSigDiffCountRoot -gt 0) {
         Write-Log "$validSigDiffCountRoot of $($filesToAnalyze.Count) differing root files have valid Microsoft signatures but differ from ISO (likely benign, no concern)." -Level "GREEN"
     }
 }
 
-if ($missingFiles.Count -gt 0) {
-    $orangeRoot += $missingFiles.Count
-}
-Write-Log "Root files: $greenRoot GREEN (incl $validCertRoot valid certs, likely benign diffs), $orangeRoot ORANGE (incl $resRoot resources + missing), $redRoot RED (incl $noCertRoot no/invalid certs)" -Context "ROOT"
 
+if ($missingFiles.Count -gt 0) {
+    $yellowRoot += $missingFiles.Count
+}
+Write-Log "Root files: $greenRoot GREEN (incl $validCertRoot valid certs, likely benign diffs), $yellowRoot YELLOW (incl $resRoot resources + missing), $redRoot RED (incl $noCertRoot no/invalid certs)" -Context "ROOT"
 
 if (-not $script:ScanSummary) { $script:ScanSummary = @{} }
+
+# Total ISO-side surface files
+$totalRootIso   = $filteredIsoHashes.Count
+
+# Files that are NOT identical or missing from the ISO side
+$rootDiffCount  = $modifiedFiles.Count + $missingFiles.Count
+$matchingRoot   = $totalRootIso - $rootDiffCount
+if ($matchingRoot -lt 0) { $matchingRoot = 0 }
+
+# Total green = "matching" + "green diffs"
+$greenTotalRoot = $matchingRoot + $greenRoot
+
 $script:ScanSummary['ROOT'] = @{
     Modified = $modifiedFiles.Count
     Extra    = $extraFiles.Count
     Missing  = $missingFiles.Count
-    Green    = $greenRoot
-    Orange   = $orangeRoot
+    Green    = $greenTotalRoot
+    Yellow   = $yellowRoot
     Red      = $redRoot
+    Images   = if ($script:RootImageContainerCount) { $script:RootImageContainerCount } else { 0 }
 }
+
+$script:SectionDetails['ROOT'] = @{
+    Modified = $modifiedFiles.Keys
+    Extra    = $extraFiles
+    Missing  = $missingFiles
+}
+
+
+
+
 
 $greenFiles += if ($greenRoot -gt 0) { "Root: $greenRoot low threat" } else { $null }
-$orangeFiles += if ($orangeRoot -gt 0) { "Root: $orangeRoot medium" } else { $null }
+$yellowFiles += if ($yellowRoot -gt 0) { "Root: $yellowRoot medium" } else { $null }
 $redFiles += if ($redRoot -gt 0) { "Root: $redRoot high threat" } else { $null }
 
-# Structured summary
-Write-FinalSummary -RedItems $redFiles -OrangeItems $orangeFiles -GreenItems $greenFiles -MissingRootCount $missingFiles.Count
+# Internal image summaries (BOOT / INSTALL) after ROOT analysis
+if ($DeepScanWIM) {
+    foreach ($phase in 'BOOT','INSTALL') {
+        # Pretty per-phase section at the end
+        Write-Log "$phase (Internal image) Analysis" -NoTimestamp -Level "IMPORTANT" -Header -Context "OPERATION"
 
-$verdict = if ($redFiles.Count -gt 0 -or $missingFiles.Count -gt 0) {
-    "RED ALERT - High risk; review."
-} elseif ($orangeFiles.Count -gt 0) {
-    "ORANGE WARNING - Likely benign (MCT diffs)."
+        if ($script:ScanSummary.ContainsKey($phase)) {
+            $s = $script:ScanSummary[$phase]
+
+            $threat =
+                if ($s.Red -gt 0) { 'RED' }
+                elseif ($s.Yellow -gt 0) { 'YELLOW' }
+                else { 'GREEN' }
+
+            $logLevel =
+                if ($threat -eq 'RED') { 'RED' }
+                elseif ($threat -eq 'YELLOW') { 'WARNING' }
+                else { 'GREEN' }
+
+            if (($s.Modified + $s.Extra + $s.Missing) -eq 0) {
+                Write-Log "Internal ${phase}: No differences between ISO and USB." -Level "GREEN" -Context $phase
+            } else {
+                Write-Log "Internal ${phase}: Modified $($s.Modified), Extra $($s.Extra), Missing $($s.Missing)." -Level "INFO" -Context $phase
+                Write-Log "Internal $phase threat: $threat (Green=$($s.Green), Yellow=$($s.Yellow), Red=$($s.Red))." -Level $logLevel -Context $phase
+            }
+        } else {
+            Write-Log "Internal $phase image not scanned (missing WIM/ESD/SWM or deep scan failed)." -Level "WARNING" -Context $phase
+        }
+    }
 } else {
-    "SAFE - All clean."
+    Write-Log "Deep internal image scanning (BOOT/INSTALL) was not enabled. Use -DeepScanWIM for full WIM/ESD/SWM comparison." -Level "IMPORTANT" -Context "OPERATION"
 }
 
-Write-Log "Verdict: $verdict" -Level "IMPORTANT" -Context "SUMMARY"
-Write-Log "Guide: GREEN=Safe, ORANGE=Benign likely (e.g., MCT customizations), RED=Review for tampering." -Context "SUMMARY"
-Write-Log "Recommendations: Manual hash/AV scan, fresh MCT ISO for comparison, check winver in VM boot." -Context "SUMMARY"
 
+# Structured summary
+Write-FinalSummary -RedItems $redFiles -YellowItems $yellowFiles -GreenItems $greenFiles -MissingRootCount $missingFiles.Count
 
-# Cleanup
-Dismount-ISO
-Clean-TempMounts
+# Clean up iso mounts
+Dismount-ISO -Quiet
+# ===== MAIN BODY END =====
+}
+catch [System.OperationCanceledException] {
+    Write-Log "Scan cancelled by user (Ctrl+C). Attempting cleanup..." -Level "WARNING"
 
+    try { Dismount-ISO -Quiet } catch {}
+    try { Clean-TempMounts } catch {}
 
-$duration = ((Get-Date) - $startTime).TotalMinutes
-Write-Log "Completed in $duration min. Log: $LogFile"
-Write-Log "===== USB Verification Report Completed =====" -NoTimestamp -Level "IMPORTANT" -Header -Context "OPERATION"
+    Write-Log "Cleanup after cancellation complete." -Level "INFO"
+}
+catch {
+    Write-Log "Fatal error: $($_.Exception.Message)" -Level "RED"
+    Write-Log $_.Exception.ToString() -Level "RED"
+
+    try { Dismount-ISO -Quiet } catch {}
+    try { Clean-TempMounts } catch {}
+}
+finally {
+    [Console]::TreatControlCAsInput = $false
+}
